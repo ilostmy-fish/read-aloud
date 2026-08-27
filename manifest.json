@@ -7,7 +7,7 @@
   "default_locale": "en",
   "browser_specific_settings": {
     "gecko": {
-      "id": "read-aloud-edge@ilostmy-fish",
+      "id": "{4a91fcba-2377-49d1-bc23-e465df3fdd1d}",
       "data_collection_permissions": {"required": ["websiteContent"]}
     },
     "gecko_android": {}
