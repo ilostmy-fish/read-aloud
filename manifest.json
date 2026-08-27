@@ -4,7 +4,7 @@
   "name": "__MSG_extension_name__",
   "short_name": "__MSG_extension_short_name__",
   "description": "__MSG_extension_description__",
-  "version": "1.81.3",
+  "version": "1.81.4",
   "default_locale": "en",
   "browser_specific_settings": {
     "gecko": {
@@ -15,13 +15,15 @@
 
   "browser_action": {
     "default_area": "navbar",
-    "default_icon": "img/icon.png",
+    "default_icon": {
+      "16": "icons/read-aloud-16.svg",
+      "32": "icons/read-aloud-32.svg"
+    },
     "default_popup": "popup.html?isPopup=1"
   },
   "icons": {
-    "16": "img/icon-16.png",
-    "48": "img/icon-48.png",
-    "128": "img/icon.png"
+    "48": "icons/read-aloud-48.svg",
+    "96": "icons/read-aloud-96.svg"
   },
   "permissions": [
     "activeTab",
