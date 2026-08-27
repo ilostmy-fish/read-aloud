@@ -1,0 +1,180 @@
+;(function() {
+  if (typeof handlers == "undefined" || typeof readSessions == "undefined") return
+
+  const originalGetPagePlaybackState = handlers.getPagePlaybackState
+  const originalPause = pause
+  const originalPlayTab = playTab
+
+  findAnchorOffset = function(text, anchor) {
+    if (!anchor || !anchor.after) return 0
+
+    const indexed = normalizeWithMap(text)
+    const before = normalizeAnchor(anchor.before || "")
+    const after = normalizeAnchor(anchor.after || "")
+    if (!after || !indexed.text.length) return 0
+
+    let progress = Number(anchor.progress)
+    if (!Number.isFinite(progress) && Number(anchor.blockCount) > 1 && Number(anchor.blockIndex) >= 0) {
+      progress = Number(anchor.blockIndex) / (Number(anchor.blockCount) - 1)
+    }
+    if (Number.isFinite(progress)) progress = Math.max(0, Math.min(1, progress))
+    const expected = Number.isFinite(progress) ? progress * (indexed.text.length - 1) : null
+
+    const candidates = []
+    if (before) {
+      candidates.push({
+        query: before + " " + after,
+        target: before.length + 1
+      })
+    }
+
+    const lengths = [240, 180, 140, 100, 72, 48, 28]
+    for (const length of lengths) {
+      if (after.length >= Math.min(length, 28)) {
+        candidates.push({query: after.slice(0, Math.min(length, after.length)), target: 0})
+      }
+    }
+
+    for (const candidate of candidates) {
+      const result = nearestOccurrence(indexed, candidate.query.toLowerCase(), candidate.target, expected)
+      if (result != null) return result
+    }
+
+    const words = after.split(" ").filter(Boolean)
+    if (words.length) {
+      const shortAnchor = words.slice(0, Math.min(6, words.length)).join(" ").toLowerCase()
+      const result = nearestOccurrence(indexed, shortAnchor, 0, expected)
+      if (result != null) return result
+    }
+
+    if (expected != null && indexed.map.length) {
+      const pos = Math.max(0, Math.min(indexed.map.length - 1, Math.round(expected)))
+      return indexed.map[pos] || 0
+    }
+    return 0
+  }
+
+  seekReadSession = async function(tabId, anchor) {
+    const session = readSessions[tabId]
+    if (!session || tabId !== activeReadTabId) return
+
+    const offset = findAnchorOffset(session.fullText, anchor)
+    if (offset == null) return
+
+    const state = await getPlaybackState()
+    const autoplay = !(session.paused || state == "PAUSED")
+    return restartReadSession(tabId, offset, autoplay)
+  }
+
+  restartReadSession = async function(tabId, offset, autoplay) {
+    const session = readSessions[tabId]
+    if (!session || tabId !== activeReadTabId) return
+    if (autoplay == null) autoplay = true
+
+    session.loading = true
+    session.offset = Math.max(0, Math.min(Number(offset) || 0, session.fullText.length))
+    session.generation = (session.generation || 0) + 1
+    session.paused = !autoplay
+    await stopActiveDocOnly()
+
+    let text = session.fullText.slice(session.offset)
+    if (!text.trim()) {
+      session.offset = 0
+      text = session.fullText
+    }
+
+    playbackError = null
+    openDoc(new SimpleSource(text.split(/(?:\r?\n){2,}/), {lang: session.lang}), function(err) {
+      if (err) playbackError = err
+      if (activeReadTabId === tabId) finishReadSession(tabId)
+    })
+
+    session.loading = false
+    if (!autoplay) return
+
+    try {
+      session.paused = false
+      return await activeDoc.play()
+    }
+    catch (err) {
+      handleError(err)
+      closeDoc()
+      finishReadSession(tabId)
+      throw err
+    }
+  }
+
+  pause = function() {
+    markActiveReadSessionPaused(true)
+    return originalPause.apply(this, arguments)
+  }
+  handlers.pause = pause
+
+  playTab = function() {
+    markActiveReadSessionPaused(false)
+    return originalPlayTab.apply(this, arguments)
+  }
+  handlers.playTab = playTab
+
+  handlers.pageTogglePlayback = async function() {
+    const tabId = this.sender.tab && this.sender.tab.id
+    const session = tabId != null ? readSessions[tabId] : null
+    if (!session || tabId !== activeReadTabId || !activeDoc) return
+
+    if (session.paused) {
+      session.paused = false
+      return activeDoc.play()
+    }
+
+    const state = await getPlaybackState()
+    if (state == "PLAYING" || state == "LOADING") {
+      session.paused = true
+      return originalPause()
+    }
+    if (state == "PAUSED" || state == "STOPPED") {
+      session.paused = false
+      return activeDoc.play()
+    }
+  }
+
+  handlers.getPagePlaybackState = async function() {
+    const result = await originalGetPagePlaybackState.apply(this, arguments)
+    const tabId = this.sender.tab && this.sender.tab.id
+    const session = tabId != null ? readSessions[tabId] : null
+    if (!result || !result.active || !session || tabId !== activeReadTabId) return result
+
+    result.sessionOffset = session.offset || 0
+    result.sessionLength = session.fullText ? session.fullText.length : 0
+    result.sessionProgress = result.sessionLength ? result.sessionOffset / result.sessionLength : 0
+    result.generation = session.generation || 0
+    if (session.paused && result.state != "LOADING") result.state = "PAUSED"
+    return result
+  }
+
+  function markActiveReadSessionPaused(value) {
+    if (activeReadTabId == null) return
+    const session = readSessions[activeReadTabId]
+    if (session) session.paused = !!value
+  }
+
+  function nearestOccurrence(indexed, query, target, expected) {
+    if (!query) return null
+    let from = 0
+    let bestTarget = null
+    let bestDistance = Infinity
+
+    while (from <= indexed.text.length - query.length) {
+      const pos = indexed.text.indexOf(query, from)
+      if (pos < 0) break
+      const targetPos = Math.max(0, Math.min(indexed.map.length - 1, pos + target))
+      const distance = expected == null ? pos : Math.abs(targetPos - expected)
+      if (distance < bestDistance) {
+        bestDistance = distance
+        bestTarget = targetPos
+      }
+      from = pos + 1
+    }
+
+    return bestTarget == null ? null : (indexed.map[bestTarget] || 0)
+  }
+})()
