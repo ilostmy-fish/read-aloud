@@ -6,7 +6,10 @@
   const originalPlayTab = playTab
 
   findAnchorOffset = function(text, anchor) {
-    if (!anchor || !anchor.after) return 0
+    if (!anchor) return 0
+    const directOffset = Number(anchor.sourceOffset)
+    if (Number.isFinite(directOffset)) return Math.max(0, Math.min(text.length, Math.round(directOffset)))
+    if (!anchor.after) return 0
 
     const indexed = normalizeWithMap(text)
     const before = normalizeAnchor(anchor.before || "")
@@ -22,10 +25,7 @@
 
     const candidates = []
     if (before) {
-      candidates.push({
-        query: before + " " + after,
-        target: before.length + 1
-      })
+      candidates.push({query: before + " " + after, target: before.length + 1})
     }
 
     const lengths = [240, 180, 140, 100, 72, 48, 28]
@@ -42,7 +42,7 @@
 
     const words = after.split(" ").filter(Boolean)
     if (words.length) {
-      const shortAnchor = words.slice(0, Math.min(6, words.length)).join(" ").toLowerCase()
+      const shortAnchor = words.slice(0, Math.min(8, words.length)).join(" ").toLowerCase()
       const result = nearestOccurrence(indexed, shortAnchor, 0, expected)
       if (result != null) return result
     }
@@ -71,8 +71,16 @@
     if (!session || tabId !== activeReadTabId) return
     if (autoplay == null) autoplay = true
 
+    let effectiveOffset = Math.max(0, Math.min(Number(offset) || 0, session.fullText.length))
+    if (!session.pageMapReady) {
+      const init = await initializePageSession(tabId, session)
+      const exactOrigin = init && init.contextOrigin && Number(init.contextOrigin.sourceOffset)
+      if (Number.isFinite(exactOrigin)) effectiveOffset = Math.max(0, Math.min(session.fullText.length, Math.round(exactOrigin)))
+      session.pageMapReady = true
+    }
+
     session.loading = true
-    session.offset = Math.max(0, Math.min(Number(offset) || 0, session.fullText.length))
+    session.offset = effectiveOffset
     session.generation = (session.generation || 0) + 1
     session.paused = !autoplay
     await stopActiveDocOnly()
@@ -149,6 +157,16 @@
     result.generation = session.generation || 0
     if (session.paused && result.state != "LOADING") result.state = "PAUSED"
     return result
+  }
+
+  function initializePageSession(tabId, session) {
+    if (!brapi.tabs || !brapi.tabs.sendMessage) return Promise.resolve(null)
+    return brapi.tabs.sendMessage(tabId, {
+      method: "firefoxReadAloudInitSession",
+      args: [session.fullText]
+    }).catch(function() {
+      return null
+    })
   }
 
   function markActiveReadSessionPaused(value) {
