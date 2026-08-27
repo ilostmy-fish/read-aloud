@@ -4,7 +4,7 @@
   "name": "__MSG_extension_name__",
   "short_name": "__MSG_extension_short_name__",
   "description": "__MSG_extension_description__",
-  "version": "1.81.0",
+  "version": "1.81.1",
   "default_locale": "en",
   "browser_specific_settings": {
     "gecko": {
@@ -43,6 +43,16 @@
   ],
   "content_security_policy": "script-src 'self'; object-src 'self'",
   "content_scripts": [
+    {
+      "matches": [
+        "http://*/*",
+        "https://*/*"
+      ],
+      "run_at": "document_start",
+      "js": [
+        "js/firefox-page.js"
+      ]
+    },
     {
       "matches": [
         "https://piper.ttstool.com/"
