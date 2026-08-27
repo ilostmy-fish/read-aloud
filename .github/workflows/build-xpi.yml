@@ -1,0 +1,36 @@
+name: Build Firefox XPI
+
+on:
+  push:
+    branches:
+      - firefox-edge-read-aloud
+    paths:
+      - .github/workflows/build-xpi.yml
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out branch
+        uses: actions/checkout@v4
+
+      - name: Verify manifest version
+        run: |
+          node -e "const m=require('./manifest.json'); if(m.version !== '1.81.8') { throw new Error('Expected 1.81.8, got ' + m.version) }"
+
+      - name: Build XPI
+        run: |
+          mkdir -p build
+          zip -q -r build/read-aloud-firefox-1.81.8.xpi _locales css icons img js sound *.html manifest.json
+          unzip -p build/read-aloud-firefox-1.81.8.xpi manifest.json | grep '"version": "1.81.8"'
+
+      - name: Upload XPI
+        uses: actions/upload-artifact@v4
+        with:
+          name: read-aloud-firefox-1.81.8
+          path: build/read-aloud-firefox-1.81.8.xpi
+          if-no-files-found: error
+          compression-level: 0
