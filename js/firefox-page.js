@@ -2,6 +2,7 @@
   const api = browser
   const BLOCK_SELECTOR = "p, li, blockquote, h1, h2, h3, h4, h5, h6, td, th, pre, article, dd, dt, figcaption"
   const INTERACTIVE_SELECTOR = "a, button, input, textarea, select, option, label, summary, [role='button'], [role='link'], [contenteditable='true']"
+  const IGNORE_SELECTOR = "script, style, svg, audio, video, dialog, embed, menu, nav, noframes, noscript, object, aside, footer, .no-read-aloud, [aria-hidden='true']"
   const ACTIVE_POLL_INTERVAL = 180
   const INACTIVE_POLL_INTERVAL = 900
 
@@ -14,14 +15,33 @@
   let highlight = null
   let highlightedElement = null
   let highlightedRange = null
-  let highlightedBlockIndex = -1
   let pendingSelectionElement = null
+  let pendingContextPoint = null
   let lastSpeechKey = null
   let lastGeneration = null
   let polling = false
   let pollTimer = null
 
+  let sessionText = ""
+  let sourceTokens = []
+  let domTokens = []
+  let sourceToDom = []
+  let domToSource = []
+  let domTokenLookup = new WeakMap()
+  let mappingDirty = true
+  let speechCache = []
+  let speechCursor = 0
+  let speechSignature = ""
+
+  api.runtime.onMessage.addListener(request => {
+    if (!request || request.method !== "firefoxReadAloudInitSession") return undefined
+    const args = request.args || []
+    initializeSession(String(args[0] || ""))
+    return Promise.resolve({contextOrigin: resolveStoredContextOrigin()})
+  })
+
   document.addEventListener("contextmenu", event => {
+    pendingContextPoint = capturePoint(event.clientX, event.clientY, event.target)
     const origin = getAnchorAtPoint(event.clientX, event.clientY, true)
     if (origin && origin.after) send("pageContextOrigin", origin).catch(() => {})
   }, true)
@@ -38,12 +58,10 @@
     event.preventDefault()
     event.stopPropagation()
 
-    pendingSelectionElement = findReadableBlock(target)
+    pendingSelectionElement = findSpecificReadableBlock(target) || findReadableBlock(target)
     if (pendingSelectionElement) {
       highlightedElement = pendingSelectionElement
       highlightedRange = null
-      const blocks = getMappingBlocks()
-      highlightedBlockIndex = blocks.indexOf(pendingSelectionElement)
       ensureHighlight()
       refreshHighlightRect()
     }
@@ -53,6 +71,20 @@
 
   window.addEventListener("scroll", refreshHighlightRect, {passive: true})
   window.addEventListener("resize", refreshHighlightRect, {passive: true})
+
+  const mutationObserver = new MutationObserver(mutations => {
+    if (!sessionText) return
+    for (const mutation of mutations) {
+      const target = mutation.target && (mutation.target.nodeType === Node.ELEMENT_NODE ? mutation.target : mutation.target.parentElement)
+      if (target && ((host && host.contains(target)) || target === highlight)) continue
+      mappingDirty = true
+      break
+    }
+  })
+  if (document.documentElement) mutationObserver.observe(document.documentElement, {childList: true, characterData: true, subtree: true})
+  else document.addEventListener("readystatechange", () => {
+    if (document.documentElement) mutationObserver.observe(document.documentElement, {childList: true, characterData: true, subtree: true})
+  }, {once: true})
 
   schedulePoll(0)
 
@@ -91,6 +123,31 @@
         if (result && result.error) throw new Error(result.error)
         return result
       })
+  }
+
+  function initializeSession(text) {
+    sessionText = text
+    sourceTokens = tokenizeString(sessionText)
+    mappingDirty = true
+    resetSpeechMapping()
+    ensureAlignment()
+  }
+
+  function clearSessionMapping() {
+    sessionText = ""
+    sourceTokens = []
+    domTokens = []
+    sourceToDom = []
+    domToSource = []
+    domTokenLookup = new WeakMap()
+    mappingDirty = true
+    resetSpeechMapping()
+  }
+
+  function resetSpeechMapping() {
+    speechCache = []
+    speechCursor = 0
+    speechSignature = ""
   }
 
   function ensureController() {
@@ -219,16 +276,17 @@
   }
 
   function setInactive() {
+    if (!active && !host && !highlight) return
     active = false
     lastSpeechKey = null
     lastGeneration = null
     highlightedElement = null
     highlightedRange = null
-    highlightedBlockIndex = -1
     pendingSelectionElement = null
     if (host) host.remove()
     if (highlight) highlight.remove()
     host = shadow = playButton = stopButton = statusNode = highlight = null
+    clearSessionMapping()
   }
 
   function updateHighlight(info) {
@@ -249,38 +307,60 @@
       return
     }
 
-    const text = speech.texts[speech.position.index]
+    const generation = Number(info.generation || 0)
+    const currentIndex = Number(speech.position.index)
+    const text = speech.texts[currentIndex]
     if (!text) {
-      hideHighlight()
+      if (state !== "PAUSED") hideHighlight()
       return
     }
 
-    const generationChanged = info.generation != null && info.generation !== lastGeneration
-    if (generationChanged) {
-      lastGeneration = info.generation
-      highlightedBlockIndex = -1
-      lastSpeechKey = null
+    ensureAlignment()
+    const mapping = resolveSpeechChunk(info)
+    if (!mapping) {
+      if (state !== "PAUSED") hideHighlight()
+      return
     }
 
     const boundaryMatches = boundary && boundary.text === text && boundary.charLength > 0
     const boundaryKey = boundaryMatches ? boundary.charIndex + ":" + boundary.charLength : "chunk"
-    const key = String(info.generation || 0) + ":" + speech.position.index + ":" + boundaryKey + ":" + text.slice(0, 160)
+    const key = generation + ":" + currentIndex + ":" + boundaryKey
     if (key === lastSpeechKey && highlightedElement) {
       refreshHighlightRect()
       return
     }
     lastSpeechKey = key
+    lastGeneration = generation
 
-    const blocks = getMappingBlocks()
-    const elem = findBestReadableElement(text, blocks, generationChanged ? info.sessionProgress : null)
+    let sourceIndex = null
+    let range = null
+    if (boundaryMatches) {
+      const chunkTokenIndex = findTokenAtChar(mapping.chunkTokens, boundary.charIndex)
+      sourceIndex = mappedTokenNear(mapping.chunkToSource, chunkTokenIndex)
+      if (sourceIndex != null) range = rangeForSourceToken(sourceIndex)
+    }
+
+    if (sourceIndex == null) sourceIndex = firstMappedValue(mapping.chunkToSource)
+    if (sourceIndex == null) {
+      if (state !== "PAUSED") hideHighlight()
+      return
+    }
+
+    const domIndex = nearestMappedDomIndex(sourceIndex)
+    if (domIndex == null || !domTokens[domIndex]) {
+      if (state !== "PAUSED") hideHighlight()
+      return
+    }
+
+    const domToken = domTokens[domIndex]
+    const elem = findSpecificReadableBlock(domToken.node.parentElement) || findReadableBlock(domToken.node.parentElement)
     if (!elem) {
       if (state !== "PAUSED") hideHighlight()
       return
     }
 
     highlightedElement = elem
-    highlightedBlockIndex = blocks.indexOf(elem)
-    highlightedRange = boundaryMatches ? findBoundaryRange(elem, boundary) : null
+    highlightedRange = boundaryMatches && range ? range : null
     pendingSelectionElement = null
     ensureHighlight()
     refreshHighlightRect()
@@ -320,30 +400,92 @@
     highlight.style.height = (rect.height + 4) + "px"
   }
 
-  function findBoundaryRange(elem, boundary) {
-    const word = normalize(boundary.text.slice(boundary.charIndex, boundary.charIndex + boundary.charLength)).toLocaleLowerCase()
-    if (!word) return null
+  function resolveSpeechChunk(info) {
+    if (!sourceTokens.length || !info.speech || !Array.isArray(info.speech.texts)) return null
+    const generation = Number(info.generation || 0)
+    const texts = info.speech.texts
+    const signature = generation + ":" + texts.length + ":" + String(texts[0] || "").slice(0, 80)
 
-    const index = makeDomTextIndex(elem)
-    if (!index.text || !index.positions.length) return null
+    if (signature !== speechSignature) {
+      speechSignature = signature
+      speechCache = []
+      speechCursor = sourceTokenIndexAtOrAfter(Number(info.sessionOffset || 0))
+    }
 
-    const chunk = normalize(boundary.text).toLocaleLowerCase()
-    const prefix = normalize(boundary.text.slice(0, boundary.charIndex)).toLocaleLowerCase()
-    let start = chunk ? index.text.indexOf(chunk) : -1
-    if (start >= 0) start += prefix.length
-    else start = index.text.indexOf(word)
-    if (start < 0) return null
+    const target = Number(info.speech.position.index)
+    if (!Number.isInteger(target) || target < 0 || target >= texts.length) return null
 
-    while (start < index.text.length && index.text[start] === " ") start++
-    const end = Math.min(index.positions.length - 1, start + word.length - 1)
-    const first = index.positions[start]
-    const last = index.positions[end]
-    if (!first || !last) return null
+    while (speechCache.length <= target) {
+      const index = speechCache.length
+      const chunkTokens = tokenizeString(String(texts[index] || ""))
+      const chunkToSource = alignChunkToSource(chunkTokens, speechCursor)
+      const mapped = chunkToSource.filter(value => value != null)
+      if (mapped.length) speechCursor = Math.max(speechCursor, mapped[mapped.length - 1] + 1)
+      speechCache.push({chunkTokens, chunkToSource})
+    }
+    return speechCache[target]
+  }
 
+  function alignChunkToSource(chunkTokens, startIndex) {
+    const out = new Array(chunkTokens.length).fill(null)
+    if (!chunkTokens.length || !sourceTokens.length) return out
+    const from = Math.max(0, Math.min(sourceTokens.length, startIndex || 0))
+    const to = Math.min(sourceTokens.length, from + chunkTokens.length + 180)
+    const sourceSlice = sourceTokens.slice(from, to)
+    const aligned = alignTokenLists(chunkTokens, sourceSlice, 70)
+    for (let i = 0; i < aligned.aToB.length; i++) {
+      if (aligned.aToB[i] != null) out[i] = from + aligned.aToB[i]
+    }
+    return out
+  }
+
+  function sourceTokenIndexAtOrAfter(offset) {
+    if (!sourceTokens.length) return 0
+    let lo = 0
+    let hi = sourceTokens.length
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1
+      if (sourceTokens[mid].end <= offset) lo = mid + 1
+      else hi = mid
+    }
+    return Math.max(0, Math.min(sourceTokens.length - 1, lo))
+  }
+
+  function findTokenAtChar(tokens, charIndex) {
+    if (!tokens.length) return 0
+    for (let i = 0; i < tokens.length; i++) {
+      if (charIndex >= tokens[i].start && charIndex < tokens[i].end) return i
+      if (tokens[i].start >= charIndex) return i
+    }
+    return tokens.length - 1
+  }
+
+  function mappedTokenNear(mapping, index) {
+    if (!mapping.length) return null
+    const start = Math.max(0, Math.min(mapping.length - 1, index || 0))
+    if (mapping[start] != null) return mapping[start]
+    for (let distance = 1; distance < Math.min(mapping.length, 12); distance++) {
+      const after = start + distance
+      if (after < mapping.length && mapping[after] != null) return mapping[after]
+      const before = start - distance
+      if (before >= 0 && mapping[before] != null) return mapping[before]
+    }
+    return null
+  }
+
+  function firstMappedValue(mapping) {
+    for (const value of mapping) if (value != null) return value
+    return null
+  }
+
+  function rangeForSourceToken(sourceIndex) {
+    const domIndex = nearestMappedDomIndex(sourceIndex)
+    const token = domIndex != null ? domTokens[domIndex] : null
+    if (!token || !token.node || !token.node.isConnected) return null
     try {
       const range = document.createRange()
-      range.setStart(first.node, first.offset)
-      range.setEnd(last.node, last.offset + 1)
+      range.setStart(token.node, token.start)
+      range.setEnd(token.node, token.end)
       return range
     }
     catch (err) {
@@ -351,154 +493,275 @@
     }
   }
 
-  function makeDomTextIndex(elem) {
-    let text = ""
-    const positions = []
-    let lastWasSpace = false
-    const walker = document.createTreeWalker(elem, NodeFilter.SHOW_TEXT)
-    let node
+  function nearestMappedDomIndex(sourceIndex) {
+    if (!sourceToDom.length) return null
+    const start = Math.max(0, Math.min(sourceToDom.length - 1, sourceIndex))
+    if (sourceToDom[start] != null) return sourceToDom[start]
+    for (let distance = 1; distance < Math.min(sourceToDom.length, 40); distance++) {
+      const after = start + distance
+      if (after < sourceToDom.length && sourceToDom[after] != null) return sourceToDom[after]
+      const before = start - distance
+      if (before >= 0 && sourceToDom[before] != null) return sourceToDom[before]
+    }
+    return null
+  }
 
-    while ((node = walker.nextNode())) {
-      const source = node.nodeValue || ""
-      for (let i = 0; i < source.length; i++) {
-        const char = source[i]
-        if (/\s/.test(char)) {
-          if (text && !lastWasSpace) {
-            text += " "
-            positions.push({node, offset: i})
-            lastWasSpace = true
-          }
-        }
-        else {
-          text += char.toLocaleLowerCase()
-          positions.push({node, offset: i})
-          lastWasSpace = false
-        }
+  function ensureAlignment() {
+    if (!sessionText || !sourceTokens.length || !mappingDirty) return
+    domTokens = collectDomTokens()
+    const aligned = alignTokenLists(sourceTokens, domTokens, 90)
+    sourceToDom = aligned.aToB
+    domToSource = aligned.bToA
+    buildDomTokenLookup()
+    mappingDirty = false
+  }
+
+  function alignTokenLists(a, b, windowSize) {
+    const aToB = new Array(a.length).fill(null)
+    const bToA = new Array(b.length).fill(null)
+    let i = 0
+    let j = 0
+
+    while (i < a.length && j < b.length) {
+      if (a[i].key === b[j].key) {
+        aToB[i] = j
+        bToA[j] = i
+        i++
+        j++
+        continue
+      }
+
+      const sync = findSync(a, i, b, j, windowSize)
+      if (sync) {
+        i += sync.aSkip
+        j += sync.bSkip
+        continue
+      }
+
+      const aAhead = findKeyAhead(b, j + 1, Math.min(b.length, j + 14), a[i].key)
+      const bAhead = findKeyAhead(a, i + 1, Math.min(a.length, i + 14), b[j].key)
+      if (aAhead != null && (bAhead == null || aAhead - j <= bAhead - i)) j++
+      else if (bAhead != null) i++
+      else {
+        i++
+        j++
       }
     }
 
-    if (text.endsWith(" ")) {
-      text = text.slice(0, -1)
-      positions.pop()
-    }
-    return {text, positions}
+    return {aToB, bToA}
   }
 
-  function findBestReadableElement(spokenText, blocks, restartProgress) {
-    const spoken = normalize(spokenText).toLocaleLowerCase()
-    if (!spoken || !blocks.length) return null
-
-    const expectedIndex = restartProgress != null && Number.isFinite(Number(restartProgress))
-      ? Math.round(Math.max(0, Math.min(1, Number(restartProgress))) * Math.max(0, blocks.length - 1))
-      : highlightedBlockIndex >= 0 ? highlightedBlockIndex : 0
-
-    if (highlightedBlockIndex >= 0 && highlightedBlockIndex < blocks.length) {
-      const currentText = normalize(blocks[highlightedBlockIndex].innerText || "").toLocaleLowerCase()
-      if (matchStrength(currentText, spoken) > 0) return blocks[highlightedBlockIndex]
-    }
-
+  function findSync(a, ai, b, bi, windowSize) {
+    const maxA = Math.min(a.length - ai, windowSize)
+    const maxB = Math.min(b.length - bi, windowSize)
     let best = null
-    let bestScore = -Infinity
-    for (let i = 0; i < blocks.length; i++) {
-      const elem = blocks[i]
-      const text = normalize(elem.innerText || "").toLocaleLowerCase()
-      if (!text) continue
-      const strength = matchStrength(text, spoken)
-      if (!strength) continue
 
-      const distance = Math.abs(i - expectedIndex)
-      const backwardPenalty = restartProgress == null && highlightedBlockIndex >= 0 && i < highlightedBlockIndex
-        ? (highlightedBlockIndex - i) * 80
-        : 0
-      const score = strength * 1000 - distance * 12 - backwardPenalty
-      if (score > bestScore) {
-        best = elem
-        bestScore = score
+    for (let aSkip = 0; aSkip < maxA; aSkip++) {
+      const key = a[ai + aSkip].key
+      if (!key) continue
+      for (let bSkip = 0; bSkip < maxB; bSkip++) {
+        if (key !== b[bi + bSkip].key) continue
+        let run = 0
+        while (run < 8 && ai + aSkip + run < a.length && bi + bSkip + run < b.length && a[ai + aSkip + run].key === b[bi + bSkip + run].key) run++
+        const distance = aSkip + bSkip
+        const acceptable = run >= 3 || (run >= 2 && key.length >= 5) || (run === 1 && key.length >= 10 && distance <= 6)
+        if (!acceptable) continue
+        const rank = distance * 100 + Math.abs(aSkip - bSkip) * 5 - run * 12 - Math.min(key.length, 20)
+        if (!best || rank < best.rank) best = {aSkip, bSkip, rank}
       }
     }
     return best
   }
 
-  function matchStrength(blockText, spoken) {
-    if (!blockText || !spoken) return 0
-    if (blockText === spoken) return spoken.length + 500
-    if (blockText.includes(spoken)) return spoken.length + 300
-    if (spoken.includes(blockText) && blockText.length >= 8) return blockText.length + 180
-
-    const anchors = makeSearchAnchors(spoken)
-    let best = 0
-    for (const anchor of anchors) {
-      if (anchor && blockText.includes(anchor)) best = Math.max(best, anchor.length)
-    }
-    return best
+  function findKeyAhead(tokens, from, to, key) {
+    for (let i = from; i < to; i++) if (tokens[i].key === key) return i
+    return null
   }
 
-  function makeSearchAnchors(text) {
-    const words = text.split(" ").filter(Boolean)
-    const anchors = []
-    if (text.length <= 160) anchors.push(text)
-    if (words.length) anchors.push(words.slice(0, 14).join(" ").slice(0, 180))
-    if (words.length > 5) anchors.push(words.slice(3, 17).join(" ").slice(0, 180))
-    if (text.length >= 24) anchors.push(text.slice(0, 120))
-    if (text.length < 24) anchors.push(text)
-    return Array.from(new Set(anchors.filter(Boolean)))
+  function collectDomTokens() {
+    const out = []
+    const roots = getReadableRoots()
+    const seenNodes = new Set()
+
+    for (const root of roots) {
+      const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT)
+      let node
+      while ((node = walker.nextNode())) {
+        if (seenNodes.has(node) || !isReadableTextNode(node)) continue
+        seenNodes.add(node)
+        const value = node.nodeValue || ""
+        const tokens = tokenizeString(value)
+        for (const token of tokens) out.push({key: token.key, node, start: token.start, end: token.end})
+      }
+    }
+    return out
+  }
+
+  function getReadableRoots() {
+    const marked = Array.from(document.querySelectorAll(".read-aloud"))
+      .filter(elem => elem !== host && isVisible(elem) && normalize(elem.innerText || ""))
+    if (marked.length) {
+      return marked.filter(elem => !marked.some(other => other !== elem && other.contains(elem)))
+    }
+
+    const raw = Array.from(document.querySelectorAll(BLOCK_SELECTOR))
+      .filter(elem => elem !== host && isVisible(elem) && normalize(elem.innerText || ""))
+    const leafish = raw.filter(elem => !raw.some(other => other !== elem && elem.contains(other)))
+    return leafish.length ? leafish : raw
+  }
+
+  function isReadableTextNode(node) {
+    const parent = node.parentElement
+    if (!parent || !node.nodeValue || !node.nodeValue.trim()) return false
+    if (host && host.contains(parent)) return false
+    if (parent.closest(IGNORE_SELECTOR)) return false
+    for (let elem = parent; elem && elem !== document.documentElement; elem = elem.parentElement) {
+      const style = getComputedStyle(elem)
+      if (style.display === "none" || style.visibility === "hidden") return false
+      if (style.position === "fixed" || style.cssFloat === "right") return false
+      if (elem.classList && elem.classList.contains("read-aloud")) break
+    }
+    return true
+  }
+
+  function buildDomTokenLookup() {
+    domTokenLookup = new WeakMap()
+    for (let i = 0; i < domTokens.length; i++) {
+      const token = domTokens[i]
+      let list = domTokenLookup.get(token.node)
+      if (!list) {
+        list = []
+        domTokenLookup.set(token.node, list)
+      }
+      list.push(i)
+    }
+  }
+
+  function tokenizeString(text) {
+    const tokens = []
+    const value = String(text || "")
+    let re
+    try {
+      re = new RegExp("[\\p{L}\\p{N}]+(?:['’][\\p{L}\\p{N}]+)*", "gu")
+    }
+    catch (err) {
+      re = /[A-Za-z0-9]+(?:['’][A-Za-z0-9]+)*/g
+    }
+    let match
+    while ((match = re.exec(value))) {
+      tokens.push({key: match[0].toLocaleLowerCase(), start: match.index, end: match.index + match[0].length})
+    }
+    return tokens
+  }
+
+  function capturePoint(x, y, target) {
+    const caret = getCaretAtPoint(x, y)
+    const elem = target && target.nodeType === Node.ELEMENT_NODE ? target : target && target.parentElement
+    return {
+      node: caret && caret.node,
+      offset: caret ? caret.offset : 0,
+      elem: elem || document.elementFromPoint(x, y)
+    }
+  }
+
+  function resolveStoredContextOrigin() {
+    if (!pendingContextPoint || !pendingContextPoint.elem || !pendingContextPoint.elem.isConnected) return null
+    ensureAlignment()
+    return getAnchorFromPointData(pendingContextPoint, true)
   }
 
   function getAnchorAtPoint(x, y, sectionStart) {
-    const caret = getCaretAtPoint(x, y)
-    let node = caret && caret.node
-    let offset = caret ? caret.offset : 0
-    let elem = node && (node.nodeType === Node.ELEMENT_NODE ? node : node.parentElement)
-    if (!elem) elem = document.elementFromPoint(x, y)
+    const point = capturePoint(x, y, document.elementFromPoint(x, y))
+    return getAnchorFromPointData(point, sectionStart)
+  }
+
+  function getAnchorFromPointData(point, sectionStart) {
+    let elem = point.elem
+    if (!elem && point.node) elem = point.node.nodeType === Node.ELEMENT_NODE ? point.node : point.node.parentElement
     if (!elem) return null
 
-    const block = findReadableBlock(elem)
+    const block = findSpecificReadableBlock(elem) || findReadableBlock(elem)
     if (!block) return null
     const blockText = normalize(block.innerText || "")
     if (!blockText) return null
 
-    const blocks = getMappingBlocks()
-    const blockIndex = blocks.indexOf(block)
-    const blockCount = blocks.length
-    const progress = getBlockProgress(block, blocks, blockIndex)
-
-    if (sectionStart) {
-      const previousText = blockIndex > 0 ? normalize(blocks[blockIndex - 1].innerText || "") : ""
-      return {
-        before: previousText.slice(Math.max(0, previousText.length - 120)),
-        after: blockText.slice(0, 240),
-        sectionStart: true,
-        blockIndex,
-        blockCount,
-        progress
-      }
-    }
+    ensureAlignment()
+    let domIndex = null
+    if (sectionStart) domIndex = firstMappedDomTokenInBlock(block)
+    else domIndex = domTokenAtPointData(point, block)
+    const sourceIndex = domIndex != null ? nearestMappedSourceIndex(domIndex) : null
+    const sourceOffset = sourceIndex != null && sourceTokens[sourceIndex] ? sourceTokens[sourceIndex].start : null
 
     let approx = 0
-    if (caret && node && block.contains(node)) {
+    if (!sectionStart && point.node && block.contains(point.node)) {
       try {
         const range = document.createRange()
         range.selectNodeContents(block)
-        range.setEnd(node, offset)
+        range.setEnd(point.node, point.offset)
         approx = normalize(range.toString()).length
       }
-      catch (err) {
-        approx = 0
-      }
+      catch (err) {}
     }
 
-    let start = Math.min(Math.max(0, approx), blockText.length)
+    let start = sectionStart ? 0 : Math.min(Math.max(0, approx), blockText.length)
     while (start > 0 && !/\s/.test(blockText[start - 1])) start--
-    const before = blockText.slice(Math.max(0, start - 120), start)
-    const after = blockText.slice(start, Math.min(blockText.length, start + 240))
+    const blocks = getDisplayBlocks()
+    const blockIndex = blocks.indexOf(block)
+    const previousText = blockIndex > 0 ? normalize(blocks[blockIndex - 1].innerText || "") : ""
+
     return {
-      before,
-      after,
-      sectionStart: false,
+      before: sectionStart ? previousText.slice(Math.max(0, previousText.length - 120)) : blockText.slice(Math.max(0, start - 120), start),
+      after: blockText.slice(sectionStart ? 0 : start, Math.min(blockText.length, (sectionStart ? 0 : start) + 240)),
+      sectionStart: !!sectionStart,
       blockIndex,
-      blockCount,
-      progress: refineProgressWithinBlock(progress, block, blocks, blockIndex, start, blockText.length)
+      blockCount: blocks.length,
+      progress: sourceOffset != null && sessionText.length ? sourceOffset / sessionText.length : getBlockProgress(block, blocks, blockIndex, start, blockText.length),
+      sourceOffset,
+      sourceTokenIndex: sourceIndex
     }
+  }
+
+  function domTokenAtPointData(point, block) {
+    if (point.node && point.node.nodeType === Node.TEXT_NODE) {
+      const indices = domTokenLookup.get(point.node) || []
+      if (indices.length) {
+        let best = indices[0]
+        let bestDistance = Infinity
+        for (const index of indices) {
+          const token = domTokens[index]
+          let distance = 0
+          if (point.offset < token.start) distance = token.start - point.offset
+          else if (point.offset > token.end) distance = point.offset - token.end
+          if (distance < bestDistance) {
+            best = index
+            bestDistance = distance
+          }
+        }
+        return best
+      }
+    }
+    return firstMappedDomTokenInBlock(block)
+  }
+
+  function firstMappedDomTokenInBlock(block) {
+    for (let i = 0; i < domTokens.length; i++) {
+      const token = domTokens[i]
+      if (token.node && block.contains(token.node) && domToSource[i] != null) return i
+    }
+    return null
+  }
+
+  function nearestMappedSourceIndex(domIndex) {
+    if (!domToSource.length) return null
+    const start = Math.max(0, Math.min(domToSource.length - 1, domIndex))
+    if (domToSource[start] != null) return domToSource[start]
+    for (let distance = 1; distance < Math.min(domToSource.length, 40); distance++) {
+      const after = start + distance
+      if (after < domToSource.length && domToSource[after] != null) return domToSource[after]
+      const before = start - distance
+      if (before >= 0 && domToSource[before] != null) return domToSource[before]
+    }
+    return null
   }
 
   function getCaretAtPoint(x, y) {
@@ -513,19 +776,17 @@
     return null
   }
 
-  function getMappingBlocks() {
-    const marked = Array.from(document.querySelectorAll(".read-aloud"))
-      .filter(elem => elem !== host && isVisible(elem) && normalize(elem.innerText || ""))
-    if (marked.length) return marked
-
+  function getDisplayBlocks() {
     const raw = Array.from(document.querySelectorAll(BLOCK_SELECTOR))
       .filter(elem => elem !== host && isVisible(elem) && normalize(elem.innerText || ""))
-
     const leafish = raw.filter(elem => !raw.some(other => other !== elem && elem.contains(other)))
-    return leafish.length ? leafish : raw
+    if (leafish.length) return leafish
+    const marked = Array.from(document.querySelectorAll(".read-aloud"))
+      .filter(elem => elem !== host && isVisible(elem) && normalize(elem.innerText || ""))
+    return marked.length ? marked : raw
   }
 
-  function getBlockProgress(block, blocks, blockIndex) {
+  function getBlockProgress(block, blocks, blockIndex, offset, blockLength) {
     if (blockIndex >= 0 && blocks.length) {
       let total = 0
       let before = 0
@@ -534,45 +795,30 @@
         if (i < blockIndex) before += length
         total += length
       }
-      if (total > 0) return Math.max(0, Math.min(1, before / total))
+      if (total > 0) return Math.max(0, Math.min(1, (before + Math.max(0, Math.min(offset || 0, blockLength || 0))) / total))
     }
-
     const rect = block.getBoundingClientRect()
     const absoluteTop = window.scrollY + rect.top
     const height = Math.max(document.documentElement.scrollHeight, document.body ? document.body.scrollHeight : 0, 1)
     return Math.max(0, Math.min(1, absoluteTop / height))
   }
 
-  function refineProgressWithinBlock(baseProgress, block, blocks, blockIndex, offset, blockLength) {
-    if (blockIndex < 0 || !blocks.length || !blockLength) return baseProgress
-    let total = 0
-    let before = 0
-    for (let i = 0; i < blocks.length; i++) {
-      const length = normalize(blocks[i].innerText || "").length + 2
-      if (i < blockIndex) before += length
-      total += length
-    }
-    if (!total) return baseProgress
-    return Math.max(0, Math.min(1, (before + Math.max(0, Math.min(offset, blockLength))) / total))
+  function findSpecificReadableBlock(elem) {
+    if (!elem) return null
+    let block = elem.closest && elem.closest(BLOCK_SELECTOR)
+    if (!block || !isVisible(block) || !normalize(block.innerText || "")) return null
+    const children = Array.from(block.querySelectorAll(BLOCK_SELECTOR))
+      .filter(child => child !== block && isVisible(child) && normalize(child.innerText || ""))
+    const containing = children.find(child => child.contains(elem))
+    return containing || block
   }
 
   function findReadableBlock(elem) {
     if (!elem) return null
-
     const marked = elem.closest && elem.closest(".read-aloud")
     if (marked && isVisible(marked) && normalize(marked.innerText || "")) return marked
-
-    let block = elem.closest && elem.closest(BLOCK_SELECTOR)
-    if (block && isVisible(block) && normalize(block.innerText || "")) {
-      const children = Array.from(block.querySelectorAll(BLOCK_SELECTOR))
-        .filter(child => child !== block && isVisible(child) && normalize(child.innerText || ""))
-      if (children.length) {
-        const containing = children.find(child => child.contains(elem))
-        if (containing) block = containing
-      }
-      return block
-    }
-
+    const specific = findSpecificReadableBlock(elem)
+    if (specific) return specific
     for (let current = elem; current && current !== document.documentElement; current = current.parentElement) {
       const text = normalize(current.innerText || "")
       if (text.length >= 20 && isVisible(current)) return current
