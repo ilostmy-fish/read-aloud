@@ -1,6 +1,6 @@
 (() => {
   const api = browser
-  const BLOCK_SELECTOR = "p, li, blockquote, h1, h2, h3, h4, h5, h6, td, th, pre, article"
+  const BLOCK_SELECTOR = "p, li, blockquote, h1, h2, h3, h4, h5, h6, td, th, pre, article, dd, dt, figcaption"
   const INTERACTIVE_SELECTOR = "a, button, input, textarea, select, option, label, summary, [role='button'], [role='link'], [contenteditable='true']"
   const ACTIVE_POLL_INTERVAL = 180
   const INACTIVE_POLL_INTERVAL = 900
@@ -14,7 +14,10 @@
   let highlight = null
   let highlightedElement = null
   let highlightedRange = null
+  let highlightedBlockIndex = -1
+  let pendingSelectionElement = null
   let lastSpeechKey = null
+  let lastGeneration = null
   let polling = false
   let pollTimer = null
 
@@ -34,6 +37,17 @@
 
     event.preventDefault()
     event.stopPropagation()
+
+    pendingSelectionElement = findReadableBlock(target)
+    if (pendingSelectionElement) {
+      highlightedElement = pendingSelectionElement
+      highlightedRange = null
+      const blocks = getMappingBlocks()
+      highlightedBlockIndex = blocks.indexOf(pendingSelectionElement)
+      ensureHighlight()
+      refreshHighlightRect()
+    }
+
     send("pageSeek", anchor).catch(() => {})
   }, true)
 
@@ -60,7 +74,7 @@
       active = true
       ensureController()
       updateController(info.state)
-      updateHighlight(info.speech, info.state, info.boundary)
+      updateHighlight(info)
     }
     catch (err) {
       setInactive()
@@ -156,7 +170,11 @@
     panel.append(playButton, stopButton, statusNode)
     shadow.append(style, panel)
     document.documentElement.appendChild(host)
+    ensureHighlight()
+  }
 
+  function ensureHighlight() {
+    if (highlight && highlight.isConnected) return
     highlight = document.createElement("div")
     highlight.id = "read-aloud-firefox-highlight"
     Object.assign(highlight.style, {
@@ -203,16 +221,31 @@
   function setInactive() {
     active = false
     lastSpeechKey = null
+    lastGeneration = null
     highlightedElement = null
     highlightedRange = null
+    highlightedBlockIndex = -1
+    pendingSelectionElement = null
     if (host) host.remove()
     if (highlight) highlight.remove()
     host = shadow = playButton = stopButton = statusNode = highlight = null
   }
 
-  function updateHighlight(speech, state, boundary) {
+  function updateHighlight(info) {
+    const speech = info && info.speech
+    const state = info && info.state
+    const boundary = info && info.boundary
+
     if (!speech || !speech.texts || !speech.position || speech.position.index == null) {
-      hideHighlight()
+      if (state === "PAUSED" && pendingSelectionElement && pendingSelectionElement.isConnected) {
+        highlightedElement = pendingSelectionElement
+        highlightedRange = null
+        ensureHighlight()
+        refreshHighlightRect()
+      }
+      else if (state !== "PAUSED") {
+        hideHighlight()
+      }
       return
     }
 
@@ -222,30 +255,34 @@
       return
     }
 
+    const generationChanged = info.generation != null && info.generation !== lastGeneration
+    if (generationChanged) {
+      lastGeneration = info.generation
+      highlightedBlockIndex = -1
+      lastSpeechKey = null
+    }
+
     const boundaryMatches = boundary && boundary.text === text && boundary.charLength > 0
     const boundaryKey = boundaryMatches ? boundary.charIndex + ":" + boundary.charLength : "chunk"
-    const key = speech.position.index + ":" + boundaryKey + ":" + text.slice(0, 140)
+    const key = String(info.generation || 0) + ":" + speech.position.index + ":" + boundaryKey + ":" + text.slice(0, 160)
     if (key === lastSpeechKey && highlightedElement) {
       refreshHighlightRect()
       return
     }
     lastSpeechKey = key
 
-    const elem = findBestReadableElement(text)
+    const blocks = getMappingBlocks()
+    const elem = findBestReadableElement(text, blocks, generationChanged ? info.sessionProgress : null)
     if (!elem) {
-      hideHighlight()
+      if (state !== "PAUSED") hideHighlight()
       return
     }
 
     highlightedElement = elem
+    highlightedBlockIndex = blocks.indexOf(elem)
     highlightedRange = boundaryMatches ? findBoundaryRange(elem, boundary) : null
-
-    if (state === "PLAYING") {
-      const rect = getCurrentHighlightRect()
-      if (rect && (rect.bottom < 80 || rect.top > window.innerHeight - 40)) {
-        elem.scrollIntoView({block: "center", behavior: "smooth"})
-      }
-    }
+    pendingSelectionElement = null
+    ensureHighlight()
     refreshHighlightRect()
   }
 
@@ -279,46 +316,119 @@
     highlight.style.display = "block"
     highlight.style.left = left + "px"
     highlight.style.top = top + "px"
-    highlight.style.width = Math.min(window.innerWidth - left, rect.width + 6) + "px"
+    highlight.style.width = Math.max(0, Math.min(window.innerWidth - left, rect.width + 6)) + "px"
     highlight.style.height = (rect.height + 4) + "px"
   }
 
   function findBoundaryRange(elem, boundary) {
-    const word = boundary.text.slice(boundary.charIndex, boundary.charIndex + boundary.charLength).trim()
+    const word = normalize(boundary.text.slice(boundary.charIndex, boundary.charIndex + boundary.charLength)).toLocaleLowerCase()
     if (!word) return null
 
-    const needle = word.toLocaleLowerCase()
-    const walker = document.createTreeWalker(elem, NodeFilter.SHOW_TEXT)
-    let node
-    while ((node = walker.nextNode())) {
-      const source = node.nodeValue || ""
-      const index = source.toLocaleLowerCase().indexOf(needle)
-      if (index < 0) continue
+    const index = makeDomTextIndex(elem)
+    if (!index.text || !index.positions.length) return null
+
+    const chunk = normalize(boundary.text).toLocaleLowerCase()
+    const prefix = normalize(boundary.text.slice(0, boundary.charIndex)).toLocaleLowerCase()
+    let start = chunk ? index.text.indexOf(chunk) : -1
+    if (start >= 0) start += prefix.length
+    else start = index.text.indexOf(word)
+    if (start < 0) return null
+
+    while (start < index.text.length && index.text[start] === " ") start++
+    const end = Math.min(index.positions.length - 1, start + word.length - 1)
+    const first = index.positions[start]
+    const last = index.positions[end]
+    if (!first || !last) return null
+
+    try {
       const range = document.createRange()
-      range.setStart(node, index)
-      range.setEnd(node, index + word.length)
+      range.setStart(first.node, first.offset)
+      range.setEnd(last.node, last.offset + 1)
       return range
     }
-    return null
+    catch (err) {
+      return null
+    }
   }
 
-  function findBestReadableElement(spokenText) {
-    const spoken = normalize(spokenText)
-    if (!spoken) return null
-    const anchors = makeSearchAnchors(spoken)
-    const nodes = document.querySelectorAll(BLOCK_SELECTOR)
-    let best = null
-    let bestLength = Infinity
+  function makeDomTextIndex(elem) {
+    let text = ""
+    const positions = []
+    let lastWasSpace = false
+    const walker = document.createTreeWalker(elem, NodeFilter.SHOW_TEXT)
+    let node
 
-    for (const elem of nodes) {
-      if (!isVisible(elem)) continue
-      const text = normalize(elem.innerText || "")
-      if (!text || text.length < 2) continue
-      if (!anchors.some(anchor => anchor && (text.includes(anchor) || anchor.includes(text.slice(0, Math.min(text.length, 80)))))) continue
-      if (text.length < bestLength) {
-        best = elem
-        bestLength = text.length
+    while ((node = walker.nextNode())) {
+      const source = node.nodeValue || ""
+      for (let i = 0; i < source.length; i++) {
+        const char = source[i]
+        if (/\s/.test(char)) {
+          if (text && !lastWasSpace) {
+            text += " "
+            positions.push({node, offset: i})
+            lastWasSpace = true
+          }
+        }
+        else {
+          text += char.toLocaleLowerCase()
+          positions.push({node, offset: i})
+          lastWasSpace = false
+        }
       }
+    }
+
+    if (text.endsWith(" ")) {
+      text = text.slice(0, -1)
+      positions.pop()
+    }
+    return {text, positions}
+  }
+
+  function findBestReadableElement(spokenText, blocks, restartProgress) {
+    const spoken = normalize(spokenText).toLocaleLowerCase()
+    if (!spoken || !blocks.length) return null
+
+    const expectedIndex = restartProgress != null && Number.isFinite(Number(restartProgress))
+      ? Math.round(Math.max(0, Math.min(1, Number(restartProgress))) * Math.max(0, blocks.length - 1))
+      : highlightedBlockIndex >= 0 ? highlightedBlockIndex : 0
+
+    if (highlightedBlockIndex >= 0 && highlightedBlockIndex < blocks.length) {
+      const currentText = normalize(blocks[highlightedBlockIndex].innerText || "").toLocaleLowerCase()
+      if (matchStrength(currentText, spoken) > 0) return blocks[highlightedBlockIndex]
+    }
+
+    let best = null
+    let bestScore = -Infinity
+    for (let i = 0; i < blocks.length; i++) {
+      const elem = blocks[i]
+      const text = normalize(elem.innerText || "").toLocaleLowerCase()
+      if (!text) continue
+      const strength = matchStrength(text, spoken)
+      if (!strength) continue
+
+      const distance = Math.abs(i - expectedIndex)
+      const backwardPenalty = restartProgress == null && highlightedBlockIndex >= 0 && i < highlightedBlockIndex
+        ? (highlightedBlockIndex - i) * 80
+        : 0
+      const score = strength * 1000 - distance * 12 - backwardPenalty
+      if (score > bestScore) {
+        best = elem
+        bestScore = score
+      }
+    }
+    return best
+  }
+
+  function matchStrength(blockText, spoken) {
+    if (!blockText || !spoken) return 0
+    if (blockText === spoken) return spoken.length + 500
+    if (blockText.includes(spoken)) return spoken.length + 300
+    if (spoken.includes(blockText) && blockText.length >= 8) return blockText.length + 180
+
+    const anchors = makeSearchAnchors(spoken)
+    let best = 0
+    for (const anchor of anchors) {
+      if (anchor && blockText.includes(anchor)) best = Math.max(best, anchor.length)
     }
     return best
   }
@@ -326,15 +436,17 @@
   function makeSearchAnchors(text) {
     const words = text.split(" ").filter(Boolean)
     const anchors = []
-    if (words.length) anchors.push(words.slice(0, 10).join(" ").slice(0, 120))
-    if (words.length > 5) anchors.push(words.slice(3, 13).join(" ").slice(0, 120))
-    anchors.push(text.slice(0, 56))
-    return anchors.filter(anchor => anchor.length >= 12)
+    if (text.length <= 160) anchors.push(text)
+    if (words.length) anchors.push(words.slice(0, 14).join(" ").slice(0, 180))
+    if (words.length > 5) anchors.push(words.slice(3, 17).join(" ").slice(0, 180))
+    if (text.length >= 24) anchors.push(text.slice(0, 120))
+    if (text.length < 24) anchors.push(text)
+    return Array.from(new Set(anchors.filter(Boolean)))
   }
 
   function getAnchorAtPoint(x, y, sectionStart) {
-    const caret = document.caretPositionFromPoint ? document.caretPositionFromPoint(x, y) : null
-    let node = caret && caret.offsetNode
+    const caret = getCaretAtPoint(x, y)
+    let node = caret && caret.node
     let offset = caret ? caret.offset : 0
     let elem = node && (node.nodeType === Node.ELEMENT_NODE ? node : node.parentElement)
     if (!elem) elem = document.elementFromPoint(x, y)
@@ -345,8 +457,21 @@
     const blockText = normalize(block.innerText || "")
     if (!blockText) return null
 
+    const blocks = getMappingBlocks()
+    const blockIndex = blocks.indexOf(block)
+    const blockCount = blocks.length
+    const progress = getBlockProgress(block, blocks, blockIndex)
+
     if (sectionStart) {
-      return {before: "", after: blockText.slice(0, 180), sectionStart: true}
+      const previousText = blockIndex > 0 ? normalize(blocks[blockIndex - 1].innerText || "") : ""
+      return {
+        before: previousText.slice(Math.max(0, previousText.length - 120)),
+        after: blockText.slice(0, 240),
+        sectionStart: true,
+        blockIndex,
+        blockCount,
+        progress
+      }
     }
 
     let approx = 0
@@ -364,14 +489,89 @@
 
     let start = Math.min(Math.max(0, approx), blockText.length)
     while (start > 0 && !/\s/.test(blockText[start - 1])) start--
-    const before = blockText.slice(Math.max(0, start - 90), start)
-    const after = blockText.slice(start, Math.min(blockText.length, start + 190))
-    return {before, after, sectionStart: false}
+    const before = blockText.slice(Math.max(0, start - 120), start)
+    const after = blockText.slice(start, Math.min(blockText.length, start + 240))
+    return {
+      before,
+      after,
+      sectionStart: false,
+      blockIndex,
+      blockCount,
+      progress: refineProgressWithinBlock(progress, block, blocks, blockIndex, start, blockText.length)
+    }
+  }
+
+  function getCaretAtPoint(x, y) {
+    if (document.caretPositionFromPoint) {
+      const caret = document.caretPositionFromPoint(x, y)
+      if (caret) return {node: caret.offsetNode, offset: caret.offset}
+    }
+    if (document.caretRangeFromPoint) {
+      const range = document.caretRangeFromPoint(x, y)
+      if (range) return {node: range.startContainer, offset: range.startOffset}
+    }
+    return null
+  }
+
+  function getMappingBlocks() {
+    const marked = Array.from(document.querySelectorAll(".read-aloud"))
+      .filter(elem => elem !== host && isVisible(elem) && normalize(elem.innerText || ""))
+    if (marked.length) return marked
+
+    const raw = Array.from(document.querySelectorAll(BLOCK_SELECTOR))
+      .filter(elem => elem !== host && isVisible(elem) && normalize(elem.innerText || ""))
+
+    const leafish = raw.filter(elem => !raw.some(other => other !== elem && elem.contains(other)))
+    return leafish.length ? leafish : raw
+  }
+
+  function getBlockProgress(block, blocks, blockIndex) {
+    if (blockIndex >= 0 && blocks.length) {
+      let total = 0
+      let before = 0
+      for (let i = 0; i < blocks.length; i++) {
+        const length = normalize(blocks[i].innerText || "").length + 2
+        if (i < blockIndex) before += length
+        total += length
+      }
+      if (total > 0) return Math.max(0, Math.min(1, before / total))
+    }
+
+    const rect = block.getBoundingClientRect()
+    const absoluteTop = window.scrollY + rect.top
+    const height = Math.max(document.documentElement.scrollHeight, document.body ? document.body.scrollHeight : 0, 1)
+    return Math.max(0, Math.min(1, absoluteTop / height))
+  }
+
+  function refineProgressWithinBlock(baseProgress, block, blocks, blockIndex, offset, blockLength) {
+    if (blockIndex < 0 || !blocks.length || !blockLength) return baseProgress
+    let total = 0
+    let before = 0
+    for (let i = 0; i < blocks.length; i++) {
+      const length = normalize(blocks[i].innerText || "").length + 2
+      if (i < blockIndex) before += length
+      total += length
+    }
+    if (!total) return baseProgress
+    return Math.max(0, Math.min(1, (before + Math.max(0, Math.min(offset, blockLength))) / total))
   }
 
   function findReadableBlock(elem) {
+    if (!elem) return null
+
+    const marked = elem.closest && elem.closest(".read-aloud")
+    if (marked && isVisible(marked) && normalize(marked.innerText || "")) return marked
+
     let block = elem.closest && elem.closest(BLOCK_SELECTOR)
-    if (block && isVisible(block) && normalize(block.innerText || "")) return block
+    if (block && isVisible(block) && normalize(block.innerText || "")) {
+      const children = Array.from(block.querySelectorAll(BLOCK_SELECTOR))
+        .filter(child => child !== block && isVisible(child) && normalize(child.innerText || ""))
+      if (children.length) {
+        const containing = children.find(child => child.contains(elem))
+        if (containing) block = containing
+      }
+      return block
+    }
 
     for (let current = elem; current && current !== document.documentElement; current = current.parentElement) {
       const text = normalize(current.innerText || "")
@@ -381,6 +581,7 @@
   }
 
   function isVisible(elem) {
+    if (!elem || !elem.isConnected) return false
     const style = getComputedStyle(elem)
     if (style.display === "none" || style.visibility === "hidden") return false
     const rect = elem.getBoundingClientRect()
