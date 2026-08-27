@@ -2,7 +2,8 @@
   const api = browser
   const BLOCK_SELECTOR = "p, li, blockquote, h1, h2, h3, h4, h5, h6, td, th, pre, article"
   const INTERACTIVE_SELECTOR = "a, button, input, textarea, select, option, label, summary, [role='button'], [role='link'], [contenteditable='true']"
-  const POLL_INTERVAL = 250
+  const ACTIVE_POLL_INTERVAL = 180
+  const INACTIVE_POLL_INTERVAL = 900
 
   let active = false
   let host = null
@@ -12,12 +13,14 @@
   let statusNode = null
   let highlight = null
   let highlightedElement = null
+  let highlightedRange = null
   let lastSpeechKey = null
   let polling = false
+  let pollTimer = null
 
   document.addEventListener("contextmenu", event => {
     const origin = getAnchorAtPoint(event.clientX, event.clientY, true)
-    if (origin && origin.after) send("pageContextOrigin", origin)
+    if (origin && origin.after) send("pageContextOrigin", origin).catch(() => {})
   }, true)
 
   document.addEventListener("click", event => {
@@ -31,14 +34,18 @@
 
     event.preventDefault()
     event.stopPropagation()
-    send("pageSeek", anchor)
+    send("pageSeek", anchor).catch(() => {})
   }, true)
 
   window.addEventListener("scroll", refreshHighlightRect, {passive: true})
   window.addEventListener("resize", refreshHighlightRect, {passive: true})
 
-  setInterval(poll, POLL_INTERVAL)
-  poll()
+  schedulePoll(0)
+
+  function schedulePoll(delay) {
+    if (pollTimer) clearTimeout(pollTimer)
+    pollTimer = setTimeout(poll, delay)
+  }
 
   async function poll() {
     if (polling) return
@@ -53,13 +60,14 @@
       active = true
       ensureController()
       updateController(info.state)
-      updateHighlight(info.speech, info.state)
+      updateHighlight(info.speech, info.state, info.boundary)
     }
     catch (err) {
       setInactive()
     }
     finally {
       polling = false
+      schedulePoll(active ? ACTIVE_POLL_INTERVAL : INACTIVE_POLL_INTERVAL)
     }
   }
 
@@ -157,9 +165,9 @@
       pointerEvents: "none",
       zIndex: "2147483646",
       borderRadius: "4px",
-      background: "rgba(255, 213, 79, .24)",
-      boxShadow: "0 0 0 2px rgba(255, 193, 7, .55) inset",
-      transition: "top .12s ease, left .12s ease, width .12s ease, height .12s ease"
+      background: "rgba(255, 213, 79, .28)",
+      boxShadow: "0 0 0 2px rgba(255, 193, 7, .58) inset",
+      transition: "top .10s ease, left .10s ease, width .10s ease, height .10s ease"
     })
     document.documentElement.appendChild(highlight)
   }
@@ -196,12 +204,13 @@
     active = false
     lastSpeechKey = null
     highlightedElement = null
+    highlightedRange = null
     if (host) host.remove()
     if (highlight) highlight.remove()
     host = shadow = playButton = stopButton = statusNode = highlight = null
   }
 
-  function updateHighlight(speech, state) {
+  function updateHighlight(speech, state, boundary) {
     if (!speech || !speech.texts || !speech.position || speech.position.index == null) {
       hideHighlight()
       return
@@ -213,7 +222,9 @@
       return
     }
 
-    const key = speech.position.index + ":" + text.slice(0, 140)
+    const boundaryMatches = boundary && boundary.text === text && boundary.charLength > 0
+    const boundaryKey = boundaryMatches ? boundary.charIndex + ":" + boundary.charLength : "chunk"
+    const key = speech.position.index + ":" + boundaryKey + ":" + text.slice(0, 140)
     if (key === lastSpeechKey && highlightedElement) {
       refreshHighlightRect()
       return
@@ -227,9 +238,11 @@
     }
 
     highlightedElement = elem
+    highlightedRange = boundaryMatches ? findBoundaryRange(elem, boundary) : null
+
     if (state === "PLAYING") {
-      const rect = elem.getBoundingClientRect()
-      if (rect.bottom < 80 || rect.top > window.innerHeight - 40) {
+      const rect = getCurrentHighlightRect()
+      if (rect && (rect.bottom < 80 || rect.top > window.innerHeight - 40)) {
         elem.scrollIntoView({block: "center", behavior: "smooth"})
       }
     }
@@ -238,21 +251,55 @@
 
   function hideHighlight() {
     highlightedElement = null
+    highlightedRange = null
     if (highlight) highlight.style.display = "none"
+  }
+
+  function getCurrentHighlightRect() {
+    if (highlightedRange) {
+      try {
+        const rangeRect = highlightedRange.getBoundingClientRect()
+        if (rangeRect.width && rangeRect.height) return rangeRect
+      }
+      catch (err) {}
+    }
+    if (highlightedElement && highlightedElement.isConnected) return highlightedElement.getBoundingClientRect()
+    return null
   }
 
   function refreshHighlightRect() {
     if (!highlight || !highlightedElement || !highlightedElement.isConnected) return
-    const rect = highlightedElement.getBoundingClientRect()
-    if (!rect.width || !rect.height || rect.bottom < 0 || rect.top > window.innerHeight) {
+    const rect = getCurrentHighlightRect()
+    if (!rect || !rect.width || !rect.height || rect.bottom < 0 || rect.top > window.innerHeight) {
       highlight.style.display = "none"
       return
     }
+    const left = Math.max(0, rect.left - 3)
+    const top = Math.max(0, rect.top - 2)
     highlight.style.display = "block"
-    highlight.style.left = Math.max(0, rect.left - 3) + "px"
-    highlight.style.top = Math.max(0, rect.top - 2) + "px"
-    highlight.style.width = Math.min(window.innerWidth - Math.max(0, rect.left - 3), rect.width + 6) + "px"
+    highlight.style.left = left + "px"
+    highlight.style.top = top + "px"
+    highlight.style.width = Math.min(window.innerWidth - left, rect.width + 6) + "px"
     highlight.style.height = (rect.height + 4) + "px"
+  }
+
+  function findBoundaryRange(elem, boundary) {
+    const word = boundary.text.slice(boundary.charIndex, boundary.charIndex + boundary.charLength).trim()
+    if (!word) return null
+
+    const needle = word.toLocaleLowerCase()
+    const walker = document.createTreeWalker(elem, NodeFilter.SHOW_TEXT)
+    let node
+    while ((node = walker.nextNode())) {
+      const source = node.nodeValue || ""
+      const index = source.toLocaleLowerCase().indexOf(needle)
+      if (index < 0) continue
+      const range = document.createRange()
+      range.setStart(node, index)
+      range.setEnd(node, index + word.length)
+      return range
+    }
+    return null
   }
 
   function findBestReadableElement(spokenText) {
