@@ -1,5 +1,8 @@
 
 var activeDoc;
+var activeReadTabId = null;
+var readSessions = {};
+var contextOrigins = {};
 var playbackError = null;
 var silenceLoop = new Audio("sound/silence.opus");
 silenceLoop.loop = true;
@@ -144,6 +147,38 @@ var handlers = {
   forward: forward,
   rewind: rewind,
   seek: seek,
+  pageContextOrigin: function(origin) {
+    const tabId = this.sender.tab && this.sender.tab.id
+    if (tabId != null && tabId != -1 && origin) contextOrigins[tabId] = origin
+    return true
+  },
+  getPagePlaybackState: async function() {
+    const tabId = this.sender.tab && this.sender.tab.id
+    const session = tabId != null ? readSessions[tabId] : null
+    if (!session || tabId !== activeReadTabId) return {active: false}
+    if (session.loading) return {active: true, state: "LOADING", speech: null}
+    const speech = await getActiveSpeech()
+    return {
+      active: true,
+      state: await getPlaybackState(),
+      speech: speech ? speech.getInfo() : null
+    }
+  },
+  pageTogglePlayback: async function() {
+    const tabId = this.sender.tab && this.sender.tab.id
+    if (tabId == null || tabId !== activeReadTabId) return
+    const state = await getPlaybackState()
+    if (state == "PLAYING") return pause()
+    if (state == "PAUSED" && activeDoc) return activeDoc.play()
+  },
+  pageStop: function() {
+    const tabId = this.sender.tab && this.sender.tab.id
+    if (tabId != null && tabId === activeReadTabId) return stop()
+  },
+  pageSeek: function(anchor) {
+    const tabId = this.sender.tab && this.sender.tab.id
+    if (tabId != null && tabId === activeReadTabId) return seekReadSession(tabId, anchor)
+  },
   reportIssue: reportIssue,
   authWavenet: authWavenet,
   ibmFetchVoices: function(apiKey, url) {
@@ -198,7 +233,7 @@ brapi.runtime.onMessage.addListener(
   function(request, sender, sendResponse) {
     var handler = handlers[request.method];
     if (handler) {
-      Promise.resolve(handler.apply({sender}, request.args))
+      Promise.resolve(handler.apply({sender}, request.args || []))
         .then(sendResponse)
         .catch(function(err) {
           sendResponse({error: err.message});
@@ -218,9 +253,16 @@ brapi.runtime.onMessage.addListener(
 function installContextMenus() {
   if (brapi.menus && brapi.menus.create) {
     brapi.menus.create({
-      id: "read-selection",
-      title: brapi.i18n.getMessage("context_read_selection"),
-      contexts: ["selection"]
+      id: "read-page",
+      title: "Read aloud",
+      contexts: ["page", "selection", "link", "image"],
+      visible: true
+    });
+    brapi.menus.create({
+      id: "stop-reading",
+      title: "Stop reading",
+      contexts: ["page", "selection", "link", "image"],
+      visible: false
     });
     brapi.menus.create({
       id: "options",
@@ -230,8 +272,30 @@ function installContextMenus() {
   }
 }
 
+function updateReadAloudMenus(tabId) {
+  if (!brapi.menus || !brapi.menus.update) return Promise.resolve()
+  const reading = tabId != null && tabId === activeReadTabId && !!readSessions[tabId]
+  return Promise.all([
+    brapi.menus.update("read-page", {visible: !reading, enabled: !reading}),
+    brapi.menus.update("stop-reading", {visible: reading, enabled: reading})
+  ])
+  .then(function() {
+    if (brapi.menus.refresh) brapi.menus.refresh()
+  })
+  .catch(function() {})
+}
+
+if (brapi.menus && brapi.menus.onShown)
+brapi.menus.onShown.addListener(function(info, tab) {
+  updateReadAloudMenus(tab && tab.id)
+})
+
 brapi.menus.onClicked.addListener(function(info, tab) {
-  if (info.menuItemId == "read-selection")
+  if (info.menuItemId == "read-page")
+    startReadAloud(tab).catch(console.error)
+  else if (info.menuItemId == "stop-reading")
+    stop().catch(console.error)
+  else if (info.menuItemId == "read-selection")
     stop()
       .then(function() {
         if (tab && tab.id != -1) return detectTabLanguage(tab.id)
@@ -271,6 +335,181 @@ brapi.commands.onCommand.addListener(function(command) {
 
 
 /**
+ * Firefox page read-aloud sessions
+ */
+async function startReadAloud(tab) {
+  if (!tab || tab.id == null || tab.id == -1) return
+  await stop()
+
+  const tabId = tab.id
+  const session = {
+    tabId: tabId,
+    fullText: "",
+    lang: null,
+    offset: 0,
+    loading: true
+  }
+  activeReadTabId = tabId
+  readSessions[tabId] = session
+  updateReadAloudMenus(tabId)
+
+  let source
+  try {
+    source = new TabSource(tabId)
+    const info = await source.ready
+    let index = await source.getCurrentIndex()
+    if (index == null || index < 0) index = 0
+    const texts = await source.getTexts(index)
+    if (!texts || !texts.length) throw new Error(JSON.stringify({code: "error_no_text"}))
+
+    session.fullText = texts.join("\n\n")
+    session.lang = info && (info.lang || info.detectedLang)
+    if (!session.lang) session.lang = await detectTabLanguage(tabId)
+    session.offset = findAnchorOffset(session.fullText, contextOrigins[tabId])
+
+    await source.close()
+    source = null
+    await restartReadSession(tabId, session.offset)
+  }
+  catch (err) {
+    if (source) source.close()
+    finishReadSession(tabId)
+    handleError(err)
+    throw err
+  }
+}
+
+async function seekReadSession(tabId, anchor) {
+  const session = readSessions[tabId]
+  if (!session || tabId !== activeReadTabId) return
+  const offset = findAnchorOffset(session.fullText, anchor)
+  if (offset == null) return
+  return restartReadSession(tabId, offset)
+}
+
+async function restartReadSession(tabId, offset) {
+  const session = readSessions[tabId]
+  if (!session || tabId !== activeReadTabId) return
+
+  session.loading = true
+  session.offset = Math.max(0, Math.min(Number(offset) || 0, session.fullText.length))
+  await stopActiveDocOnly()
+
+  let text = session.fullText.slice(session.offset)
+  if (!text.trim()) {
+    session.offset = 0
+    text = session.fullText
+  }
+
+  playbackError = null
+  openDoc(new SimpleSource(text.split(/(?:\r?\n){2,}/), {lang: session.lang}), function(err) {
+    if (err) playbackError = err
+    if (activeReadTabId === tabId) finishReadSession(tabId)
+  })
+
+  try {
+    session.loading = false
+    return await activeDoc.play()
+  }
+  catch (err) {
+    session.loading = false
+    handleError(err)
+    closeDoc()
+    finishReadSession(tabId)
+    throw err
+  }
+}
+
+async function stopActiveDocOnly() {
+  if (!activeDoc) return
+  try {
+    await activeDoc.stop()
+  }
+  catch (err) {}
+  closeDoc()
+}
+
+function finishReadSession(tabId) {
+  delete readSessions[tabId]
+  if (activeReadTabId === tabId) activeReadTabId = null
+  updateReadAloudMenus(tabId)
+}
+
+function findAnchorOffset(text, anchor) {
+  if (!anchor || !anchor.after) return 0
+
+  const indexed = normalizeWithMap(text)
+  const before = normalizeAnchor(anchor.before || "")
+  const after = normalizeAnchor(anchor.after || "")
+  if (!after) return 0
+
+  const candidates = []
+  if (before) {
+    candidates.push({
+      query: before + " " + after,
+      target: before.length + 1
+    })
+  }
+
+  const lengths = [180, 140, 100, 72, 48, 28]
+  for (const length of lengths) {
+    if (after.length >= Math.min(length, 28)) {
+      candidates.push({query: after.slice(0, Math.min(length, after.length)), target: 0})
+    }
+  }
+
+  for (const candidate of candidates) {
+    const pos = indexed.text.indexOf(candidate.query.toLowerCase())
+    if (pos >= 0) {
+      const targetPos = Math.min(pos + candidate.target, indexed.map.length - 1)
+      return targetPos >= 0 ? indexed.map[targetPos] : 0
+    }
+  }
+
+  const words = after.split(" ").filter(Boolean)
+  if (words.length) {
+    const shortAnchor = words.slice(0, Math.min(6, words.length)).join(" ").toLowerCase()
+    const pos = indexed.text.indexOf(shortAnchor)
+    if (pos >= 0) return indexed.map[pos] || 0
+  }
+
+  return 0
+}
+
+function normalizeWithMap(text) {
+  let out = ""
+  const map = []
+  let lastWasSpace = false
+
+  for (let i=0; i<text.length; i++) {
+    const char = text[i]
+    if (/\s/.test(char)) {
+      if (out && !lastWasSpace) {
+        out += " "
+        map.push(i)
+        lastWasSpace = true
+      }
+    }
+    else {
+      out += char.toLowerCase()
+      map.push(i)
+      lastWasSpace = false
+    }
+  }
+
+  if (out.endsWith(" ")) {
+    out = out.slice(0, -1)
+    map.pop()
+  }
+  return {text: out, map: map}
+}
+
+function normalizeAnchor(text) {
+  return String(text || "").replace(/\s+/g, " ").trim().toLowerCase()
+}
+
+
+/**
  * METHODS
  */
 function playText(text, opts) {
@@ -304,13 +543,10 @@ function playTab(tabId) {
     })
 }
 
-function stop() {
-  if (activeDoc) {
-    activeDoc.stop();
-    closeDoc();
-    return Promise.resolve();
-  }
-  else return Promise.resolve();
+async function stop() {
+  const tabId = activeReadTabId
+  await stopActiveDocOnly()
+  if (tabId != null) finishReadSession(tabId)
 }
 
 function pause() {
