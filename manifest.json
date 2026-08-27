@@ -4,7 +4,7 @@
   "name": "__MSG_extension_name__",
   "short_name": "__MSG_extension_short_name__",
   "description": "__MSG_extension_description__",
-  "version": "1.81.1",
+  "version": "1.81.2",
   "default_locale": "en",
   "browser_specific_settings": {
     "gecko": {
@@ -85,7 +85,8 @@
       "js/tts-engines.js",
       "js/speech.js",
       "js/document.js",
-      "js/events.js"
+      "js/events.js",
+      "js/firefox-tts.js"
     ],
     "persistent": true
   },
