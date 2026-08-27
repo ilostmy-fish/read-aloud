@@ -4,6 +4,58 @@
   const originalGetPagePlaybackState = handlers.getPagePlaybackState
   const originalPause = pause
   const originalPlayTab = playTab
+  let readSessionSerial = 0
+
+  startReadAloud = async function(tab) {
+    if (!tab || tab.id == null || tab.id == -1) return
+
+    const tabId = tab.id
+    const previousTabId = activeReadTabId
+    if (previousTabId != null) await resetPageMapping(previousTabId)
+    await stop()
+    await resetPageMapping(tabId)
+
+    const serial = ++readSessionSerial
+    const session = {
+      tabId: tabId,
+      fullText: "",
+      lang: null,
+      offset: 0,
+      loading: true,
+      pageMapReady: false,
+      refreshMapAfterStart: true,
+      generationBase: serial * 1000000,
+      generationCount: 0
+    }
+    activeReadTabId = tabId
+    readSessions[tabId] = session
+    updateReadAloudMenus(tabId)
+
+    let source
+    try {
+      source = new TabSource(tabId)
+      const info = await source.ready
+      let index = await source.getCurrentIndex()
+      if (index == null || index < 0) index = 0
+      const texts = await source.getTexts(index)
+      if (!texts || !texts.length) throw new Error(JSON.stringify({code: "error_no_text"}))
+
+      session.fullText = texts.join("\n\n")
+      session.lang = info && (info.lang || info.detectedLang)
+      if (!session.lang) session.lang = await detectTabLanguage(tabId)
+      session.offset = findAnchorOffset(session.fullText, contextOrigins[tabId])
+
+      await source.close()
+      source = null
+      await restartReadSession(tabId, session.offset)
+    }
+    catch (err) {
+      if (source) source.close()
+      finishReadSession(tabId)
+      handleError(err)
+      throw err
+    }
+  }
 
   findAnchorOffset = function(text, anchor) {
     if (!anchor) return 0
@@ -81,7 +133,8 @@
 
     session.loading = true
     session.offset = effectiveOffset
-    session.generation = (session.generation || 0) + 1
+    session.generationCount = (session.generationCount || 0) + 1
+    session.generation = (session.generationBase || 0) + session.generationCount
     session.paused = !autoplay
     await stopActiveDocOnly()
 
@@ -102,7 +155,12 @@
 
     try {
       session.paused = false
-      return await activeDoc.play()
+      const result = await activeDoc.play()
+      if (session.refreshMapAfterStart && activeReadTabId === tabId && readSessions[tabId] === session) {
+        session.refreshMapAfterStart = false
+        await initializePageSession(tabId, session)
+      }
+      return result
     }
     catch (err) {
       handleError(err)
@@ -157,6 +215,14 @@
     result.generation = session.generation || 0
     if (session.paused && result.state != "LOADING") result.state = "PAUSED"
     return result
+  }
+
+  function resetPageMapping(tabId) {
+    if (tabId == null || tabId == -1 || !brapi.tabs || !brapi.tabs.sendMessage) return Promise.resolve()
+    return brapi.tabs.sendMessage(tabId, {
+      method: "firefoxReadAloudInitSession",
+      args: [""]
+    }).catch(function() {})
   }
 
   function initializePageSession(tabId, session) {
