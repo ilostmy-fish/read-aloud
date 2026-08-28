@@ -323,7 +323,10 @@
     }
 
     const boundaryMatches = boundary && boundary.text === text && boundary.charLength > 0
-    const boundaryKey = boundaryMatches ? boundary.charIndex + ":" + boundary.charLength : "chunk"
+    const sentenceLevel = !boundaryMatches && (speech.engine === "Piper" || speech.engine === "Supertonic")
+    const boundaryKey = boundaryMatches
+      ? boundary.charIndex + ":" + boundary.charLength
+      : sentenceLevel ? "sentence" : "chunk"
     const key = generation + ":" + currentIndex + ":" + boundaryKey
     if (key === lastSpeechKey && highlightedElement) {
       refreshHighlightRect()
@@ -338,6 +341,13 @@
       const chunkTokenIndex = findTokenAtChar(mapping.chunkTokens, boundary.charIndex)
       sourceIndex = mappedTokenNear(mapping.chunkToSource, chunkTokenIndex)
       if (sourceIndex != null) range = rangeForSourceToken(sourceIndex)
+    }
+    else if (sentenceLevel) {
+      const span = mappedSourceSpan(mapping.chunkToSource)
+      if (span) {
+        sourceIndex = span.start
+        range = rangeForSourceSpan(span.start, span.end)
+      }
     }
 
     if (sourceIndex == null) sourceIndex = firstMappedValue(mapping.chunkToSource)
@@ -360,7 +370,7 @@
     }
 
     highlightedElement = elem
-    highlightedRange = boundaryMatches && range ? range : null
+    highlightedRange = (boundaryMatches || sentenceLevel) && range ? range : null
     pendingSelectionElement = null
     ensureHighlight()
     refreshHighlightRect()
@@ -476,6 +486,39 @@
   function firstMappedValue(mapping) {
     for (const value of mapping) if (value != null) return value
     return null
+  }
+
+  function mappedSourceSpan(mapping) {
+    let start = null
+    let end = null
+    for (const value of mapping) {
+      if (value == null) continue
+      if (start == null) start = value
+      end = value
+    }
+    return start == null ? null : {start, end}
+  }
+
+  function rangeForSourceSpan(startSourceIndex, endSourceIndex) {
+    const startDomIndex = nearestMappedDomIndex(startSourceIndex)
+    const endDomIndex = nearestMappedDomIndex(endSourceIndex)
+    if (startDomIndex == null || endDomIndex == null || startDomIndex > endDomIndex) {
+      return rangeForSourceToken(startSourceIndex)
+    }
+
+    const first = domTokens[startDomIndex]
+    const last = domTokens[endDomIndex]
+    if (!first || !last || !first.node || !last.node || !first.node.isConnected || !last.node.isConnected) return null
+
+    try {
+      const range = document.createRange()
+      range.setStart(first.node, first.start)
+      range.setEnd(last.node, last.end)
+      return range
+    }
+    catch (err) {
+      return null
+    }
   }
 
   function rangeForSourceToken(sourceIndex) {

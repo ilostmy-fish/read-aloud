@@ -456,17 +456,27 @@
     const text = info.speech.texts[currentIndex]
     const boundary = info.boundary
     const boundaryMatches = boundary && boundary.text === text && boundary.charLength > 0
+    const sentenceLevel = !boundaryMatches && (info.speech.engine === 'Piper' || info.speech.engine === 'Supertonic')
 
     let sourceIndex = null
+    let sourceEndIndex = null
     if (boundaryMatches) {
       const chunkTokenIndex = findTokenAtChar(mapping.chunkTokens, boundary.charIndex)
       sourceIndex = mappedTokenNear(mapping.chunkToSource, chunkTokenIndex)
+    }
+    else if (sentenceLevel) {
+      const span = mappedSourceSpan(mapping.chunkToSource)
+      if (span) {
+        sourceIndex = span.start
+        sourceEndIndex = span.end
+      }
     }
     if (sourceIndex == null) sourceIndex = firstMappedValue(mapping.chunkToSource)
     if (sourceIndex == null) {
       hideHighlight()
       return
     }
+    if (sourceEndIndex == null) sourceEndIndex = sourceIndex
 
     const turn = findTurnForSourceToken(sourceIndex)
     if (!turn) {
@@ -480,7 +490,10 @@
       return
     }
 
-    const range = rangeForTurnSourceToken(turn, sourceIndex, message)
+    const endTurn = sentenceLevel ? findTurnForSourceToken(sourceEndIndex) : turn
+    const range = sentenceLevel && endTurn && endTurn.key === turn.key
+      ? rangeForTurnSourceSpan(turn, sourceIndex, sourceEndIndex, message)
+      : rangeForTurnSourceToken(turn, sourceIndex, message)
     if (!range) {
       showElementHighlight(message)
       return
@@ -576,38 +589,35 @@
     return cached
   }
 
-  function rangeForTurnSourceToken(turn, sourceIndex, message) {
-    const localIndex = sourceIndex - turn.sourceTokenStart
-    if (localIndex < 0) return null
+  function rangeForTurnSourceSpan(turn, startSourceIndex, endSourceIndex, message) {
+    const startLocalIndex = startSourceIndex - turn.sourceTokenStart
+    const endLocalIndex = endSourceIndex - turn.sourceTokenStart
+    if (startLocalIndex < 0 || endLocalIndex < startLocalIndex) return null
 
     const cached = getTurnDomAlignment(turn, message)
     if (!cached) return null
 
-    let domIndex = cached.sourceToDom[localIndex]
-    if (domIndex == null) {
-      for (let distance = 1; distance < Math.min(cached.sourceToDom.length, 24); distance++) {
-        if (localIndex + distance < cached.sourceToDom.length && cached.sourceToDom[localIndex + distance] != null) {
-          domIndex = cached.sourceToDom[localIndex + distance]
-          break
-        }
-        if (localIndex - distance >= 0 && cached.sourceToDom[localIndex - distance] != null) {
-          domIndex = cached.sourceToDom[localIndex - distance]
-          break
-        }
-      }
-    }
-    const token = domIndex != null ? cached.domLocal[domIndex] : null
-    if (!token || !token.node || !token.node.isConnected) return null
+    const startDomIndex = mappedValueNear(cached.sourceToDom, startLocalIndex, 12)
+    const endDomIndex = mappedValueNear(cached.sourceToDom, endLocalIndex, 12)
+    if (startDomIndex == null || endDomIndex == null || startDomIndex > endDomIndex) return null
+
+    const first = cached.domLocal[startDomIndex]
+    const last = cached.domLocal[endDomIndex]
+    if (!first || !last || !first.node || !last.node || !first.node.isConnected || !last.node.isConnected) return null
 
     try {
       const range = document.createRange()
-      range.setStart(token.node, token.start)
-      range.setEnd(token.node, token.end)
+      range.setStart(first.node, first.start)
+      range.setEnd(last.node, last.end)
       return range
     }
     catch (err) {
       return null
     }
+  }
+
+  function rangeForTurnSourceToken(turn, sourceIndex, message) {
+    return rangeForTurnSourceSpan(turn, sourceIndex, sourceIndex, message)
   }
 
   function installGenericHighlightSuppressor() {
@@ -803,6 +813,17 @@
   function firstMappedValue(mapping) {
     for (const value of mapping) if (value != null) return value
     return null
+  }
+
+  function mappedSourceSpan(mapping) {
+    let start = null
+    let end = null
+    for (const value of mapping) {
+      if (value == null) continue
+      if (start == null) start = value
+      end = value
+    }
+    return start == null ? null : {start, end}
   }
 
   function send(method, ...args) {
