@@ -1,0 +1,29 @@
+name: Build Firefox XPI
+
+on:
+  push:
+    branches:
+      - firefox-edge-read-aloud
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify extension version
+        run: test "$(jq -r .version manifest.json)" = "1.81.11"
+
+      - name: Build Firefox XPI
+        run: |
+          mkdir -p build
+          zip -r build/read-aloud-firefox-1.81.11.xpi _locales css icons img js sound *.html manifest.json
+          unzip -t build/read-aloud-firefox-1.81.11.xpi
+
+      - name: Upload Firefox XPI
+        uses: actions/upload-artifact@v4
+        with:
+          name: read-aloud-firefox-1.81.11
+          path: build/read-aloud-firefox-1.81.11.xpi
+          if-no-files-found: error
+          compression-level: 0
