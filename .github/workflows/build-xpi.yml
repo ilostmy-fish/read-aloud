@@ -1,0 +1,35 @@
+name: Build Firefox XPI
+
+on:
+  push:
+    branches:
+      - build-xpi-1.81.10
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Verify extension version
+        shell: bash
+        run: |
+          test "$(jq -r '.version' manifest.json)" = "1.81.10"
+
+      - name: Package Firefox extension
+        shell: bash
+        run: |
+          mkdir -p build
+          zip -r -9 build/read-aloud-firefox-1.81.10.xpi _locales css icons img js sound *.html manifest.json
+
+      - name: Upload XPI
+        uses: actions/upload-artifact@v4
+        with:
+          name: read-aloud-firefox-1.81.10
+          path: build/read-aloud-firefox-1.81.10.xpi
+          if-no-files-found: error
+          compression-level: 0
