@@ -3,7 +3,7 @@
   "name": "__MSG_extension_name__",
   "short_name": "__MSG_extension_short_name__",
   "description": "__MSG_extension_description__",
-  "version": "1.81.10",
+  "version": "1.81.11",
   "default_locale": "en",
   "browser_specific_settings": {
     "gecko": {
@@ -19,11 +19,12 @@
   "web_accessible_resources": ["js/page/*", "img/*", "css/*"],
   "content_security_policy": "script-src 'self'; object-src 'self'",
   "content_scripts": [
-    {"matches": ["http://*/*", "https://*/*"], "run_at": "document_start", "js": ["js/firefox-page.js"]},
+    {"matches": ["http://*/*", "https://*/*"], "exclude_matches": ["https://chatgpt.com/*", "https://www.chatgpt.com/*", "https://chat.openai.com/*"], "run_at": "document_start", "js": ["js/firefox-page.js"]},
+    {"matches": ["https://chatgpt.com/*", "https://www.chatgpt.com/*", "https://chat.openai.com/*"], "run_at": "document_start", "js": ["js/firefox-chatgpt.js", "js/firefox-page.js"]},
     {"matches": ["https://piper.ttstool.com/"], "js": ["js/rxjs.umd.min.js", "js/messaging.js", "js/piper.js"]},
     {"matches": ["https://supertonic.ttstool.com/"], "run_at": "document_start", "js": ["js/rxjs.umd.min.js", "js/messaging.js", "js/supertonic.js"]}
   ],
-  "background": {"scripts": ["js/rxjs.umd.min.js", "js/peerjs-1.4.7.min.js", "js/defaults.js", "js/messaging.js", "js/google-translate.js", "js/tts-engines.js", "js/speech.js", "js/document.js", "js/events.js", "js/firefox-supertonic.js", "js/firefox-tts.js", "js/firefox-fixes.js"], "persistent": true},
+  "background": {"scripts": ["js/rxjs.umd.min.js", "js/peerjs-1.4.7.min.js", "js/defaults.js", "js/messaging.js", "js/google-translate.js", "js/tts-engines.js", "js/speech.js", "js/document.js", "js/events.js", "js/firefox-supertonic.js", "js/firefox-tts.js", "js/firefox-fixes.js", "js/firefox-chatgpt-background.js"], "persistent": true},
   "options_page": "options.html",
   "options_ui": {"page": "options.html", "chrome_style": false},
   "commands": {
