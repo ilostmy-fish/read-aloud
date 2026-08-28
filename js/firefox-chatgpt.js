@@ -287,7 +287,15 @@
     if (tokenIndex == null) tokenIndex = 0
 
     let sourceOffset = null
-    if (turn) sourceOffset = sourceOffsetForTurnToken(turn, tokenIndex)
+    let sourceTokenIndex = null
+    if (turn) {
+      const alignment = getTurnDomAlignment(turn, message, domTokens)
+      if (alignment) {
+        sourceTokenIndex = alignment.domToSource[tokenIndex]
+        if (sourceTokenIndex == null) sourceTokenIndex = mappedTokenNear(alignment.domToSource, tokenIndex, 5)
+        if (sourceTokenIndex != null) sourceOffset = sourceOffsetForTurnToken(turn, sourceTokenIndex)
+      }
+    }
 
     return {
       after: record.text.slice(0, 240),
@@ -295,7 +303,7 @@
       sectionStart: !!sectionStart,
       sourceOffset,
       chatgptTurnKey: identity.key,
-      chatgptTokenIndex: tokenIndex
+      chatgptSourceTokenIndex: sourceTokenIndex
     }
   }
 
@@ -525,30 +533,43 @@
     return null
   }
 
-  function rangeForTurnSourceToken(turn, sourceIndex, message) {
-    const localIndex = sourceIndex - turn.sourceTokenStart
-    if (localIndex < 0) return null
-
+  function getTurnDomAlignment(turn, message, domLocal) {
+    if (!turn || !message) return null
     const sourceLocal = sourceTokens.slice(turn.sourceTokenStart, turn.sourceTokenEnd)
-    const domLocal = collectDomTokens(message)
+    if (!domLocal) domLocal = collectDomTokens(message)
     if (!sourceLocal.length || !domLocal.length) return null
 
     const signature = turn.key + ':' + extractMessageText(message).slice(0, 160) + ':' + domLocal.length
     let cached = domMapCache.get(turn.key)
     if (!cached || cached.signature !== signature) {
-      cached = {signature, map: alignTokenLists(sourceLocal, domLocal, 100).aToB, domLocal}
+      const aligned = alignTokenLists(sourceLocal, domLocal, 100)
+      cached = {
+        signature,
+        sourceToDom: aligned.aToB,
+        domToSource: aligned.bToA,
+        domLocal
+      }
       domMapCache.set(turn.key, cached)
     }
+    return cached
+  }
 
-    let domIndex = cached.map[localIndex]
+  function rangeForTurnSourceToken(turn, sourceIndex, message) {
+    const localIndex = sourceIndex - turn.sourceTokenStart
+    if (localIndex < 0) return null
+
+    const cached = getTurnDomAlignment(turn, message)
+    if (!cached) return null
+
+    let domIndex = cached.sourceToDom[localIndex]
     if (domIndex == null) {
-      for (let distance = 1; distance < Math.min(cached.map.length, 24); distance++) {
-        if (localIndex + distance < cached.map.length && cached.map[localIndex + distance] != null) {
-          domIndex = cached.map[localIndex + distance]
+      for (let distance = 1; distance < Math.min(cached.sourceToDom.length, 24); distance++) {
+        if (localIndex + distance < cached.sourceToDom.length && cached.sourceToDom[localIndex + distance] != null) {
+          domIndex = cached.sourceToDom[localIndex + distance]
           break
         }
-        if (localIndex - distance >= 0 && cached.map[localIndex - distance] != null) {
-          domIndex = cached.map[localIndex - distance]
+        if (localIndex - distance >= 0 && cached.sourceToDom[localIndex - distance] != null) {
+          domIndex = cached.sourceToDom[localIndex - distance]
           break
         }
       }
@@ -745,11 +766,12 @@
     return tokens.length - 1
   }
 
-  function mappedTokenNear(mapping, index) {
+  function mappedTokenNear(mapping, index, maxDistance) {
     if (!mapping.length) return null
     const start = Math.max(0, Math.min(mapping.length - 1, index || 0))
     if (mapping[start] != null) return mapping[start]
-    for (let distance = 1; distance < Math.min(mapping.length, 16); distance++) {
+    const limit = Math.max(1, Number(maxDistance) || 15)
+    for (let distance = 1; distance <= limit && distance < mapping.length; distance++) {
       if (start + distance < mapping.length && mapping[start + distance] != null) return mapping[start + distance]
       if (start - distance >= 0 && mapping[start - distance] != null) return mapping[start - distance]
     }

@@ -126,11 +126,13 @@
       if (turn) {
         const turnText = session.fullText.slice(turn.start, turn.end)
         const tokens = tokenize(turnText)
-        if (tokens.length) {
-          const tokenIndex = Math.max(0, Math.min(tokens.length - 1, Number(anchor.chatgptTokenIndex) || 0))
-          return turn.start + tokens[tokenIndex].start
+        if (tokens.length && anchor.chatgptSourceTokenIndex != null) {
+          const value = Number(anchor.chatgptSourceTokenIndex)
+          if (Number.isFinite(value)) {
+            const tokenIndex = Math.max(0, Math.min(tokens.length - 1, Math.round(value)))
+            return turn.start + tokens[tokenIndex].start
+          }
         }
-        return turn.start
       }
     }
 
