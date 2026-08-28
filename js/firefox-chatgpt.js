@@ -289,11 +289,10 @@
     let sourceOffset = null
     let sourceTokenIndex = null
     if (turn) {
-      const alignment = getTurnDomAlignment(turn, message, domTokens)
-      if (alignment) {
-        sourceTokenIndex = alignment.domToSource[tokenIndex]
-        if (sourceTokenIndex == null) sourceTokenIndex = mappedTokenNear(alignment.domToSource, tokenIndex, 5)
-        if (sourceTokenIndex != null) sourceOffset = sourceOffsetForTurnToken(turn, sourceTokenIndex)
+      const mapped = sourcePositionForDomToken(turn, message, domTokens, tokenIndex, sectionStart ? 6 : 0)
+      if (mapped) {
+        sourceOffset = mapped.sourceOffset
+        sourceTokenIndex = mapped.localSourceIndex
       }
     }
 
@@ -383,13 +382,29 @@
     return null
   }
 
-  function sourceOffsetForTurnToken(turn, localTokenIndex) {
-    if (!turn) return null
-    const start = Math.max(0, turn.sourceTokenStart || 0)
-    const end = Math.max(start, turn.sourceTokenEnd || start)
-    const sourceIndex = Math.min(Math.max(start + localTokenIndex, start), Math.max(start, end - 1))
+  function sourcePositionForDomToken(turn, message, domTokens, domIndex, maxDistance) {
+    const alignment = getTurnDomAlignment(turn, message, domTokens)
+    if (!alignment) return null
+
+    const localSourceIndex = mappedValueNear(alignment.domToSource, domIndex, maxDistance || 0)
+    if (localSourceIndex == null) return null
+
+    const sourceIndex = turn.sourceTokenStart + localSourceIndex
     const token = sourceTokens[sourceIndex]
-    return token ? token.start : turn.start
+    if (!token) return null
+    return {localSourceIndex, sourceOffset: token.start}
+  }
+
+  function mappedValueNear(mapping, index, maxDistance) {
+    if (!mapping || !mapping.length || index == null) return null
+    const start = Math.max(0, Math.min(mapping.length - 1, index))
+    if (mapping[start] != null) return mapping[start]
+
+    for (let distance = 1; distance <= maxDistance; distance++) {
+      if (start + distance < mapping.length && mapping[start + distance] != null) return mapping[start + distance]
+      if (start - distance >= 0 && mapping[start - distance] != null) return mapping[start - distance]
+    }
+    return null
   }
 
   function schedulePoll(delay) {
@@ -539,7 +554,14 @@
     if (!domLocal) domLocal = collectDomTokens(message)
     if (!sourceLocal.length || !domLocal.length) return null
 
-    const signature = turn.key + ':' + extractMessageText(message).slice(0, 160) + ':' + domLocal.length
+    const signature = [
+      turn.key,
+      turn.start,
+      turn.end,
+      sourceLocal.length,
+      domLocal.length,
+      extractMessageText(message).slice(0, 160)
+    ].join(':')
     let cached = domMapCache.get(turn.key)
     if (!cached || cached.signature !== signature) {
       const aligned = alignTokenLists(sourceLocal, domLocal, 100)
