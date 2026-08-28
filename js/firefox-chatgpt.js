@@ -407,6 +407,26 @@
     return null
   }
 
+  function mappedValueAtOrAfter(mapping, index, maxDistance) {
+    if (!mapping || !mapping.length || index == null) return null
+    const start = Math.max(0, Math.min(mapping.length - 1, index))
+    for (let distance = 0; distance <= maxDistance && start + distance < mapping.length; distance++) {
+      const value = mapping[start + distance]
+      if (value != null) return value
+    }
+    return null
+  }
+
+  function mappedValueAtOrBefore(mapping, index, maxDistance) {
+    if (!mapping || !mapping.length || index == null) return null
+    const start = Math.max(0, Math.min(mapping.length - 1, index))
+    for (let distance = 0; distance <= maxDistance && start - distance >= 0; distance++) {
+      const value = mapping[start - distance]
+      if (value != null) return value
+    }
+    return null
+  }
+
   function schedulePoll(delay) {
     if (pollTimer) clearTimeout(pollTimer)
     pollTimer = setTimeout(poll, delay)
@@ -597,8 +617,8 @@
     const cached = getTurnDomAlignment(turn, message)
     if (!cached) return null
 
-    const startDomIndex = mappedValueNear(cached.sourceToDom, startLocalIndex, 12)
-    const endDomIndex = mappedValueNear(cached.sourceToDom, endLocalIndex, 12)
+    const startDomIndex = mappedValueAtOrAfter(cached.sourceToDom, startLocalIndex, 12)
+    const endDomIndex = mappedValueAtOrBefore(cached.sourceToDom, endLocalIndex, 12)
     if (startDomIndex == null || endDomIndex == null || startDomIndex > endDomIndex) return null
 
     const first = cached.domLocal[startDomIndex]
@@ -638,14 +658,32 @@
     Object.assign(highlight.style, {
       position: 'fixed',
       display: 'none',
+      left: '0',
+      top: '0',
+      width: '0',
+      height: '0',
       pointerEvents: 'none',
-      zIndex: '2147483646',
-      borderRadius: '4px',
-      background: 'rgba(255, 213, 79, .28)',
-      boxShadow: '0 0 0 2px rgba(255, 193, 7, .58) inset',
-      transition: 'top .10s ease, left .10s ease, width .10s ease, height .10s ease'
+      zIndex: '2147483646'
     })
     document.documentElement.appendChild(highlight)
+  }
+
+  function ensureHighlightParts(count) {
+    ensureHighlight()
+    while (highlight.children.length < count) {
+      const part = document.createElement('div')
+      part.className = 'read-aloud-firefox-chatgpt-highlight-part'
+      Object.assign(part.style, {
+        position: 'fixed',
+        display: 'none',
+        pointerEvents: 'none',
+        borderRadius: '4px',
+        background: 'rgba(255, 213, 79, .28)',
+        boxShadow: '0 0 0 2px rgba(255, 193, 7, .58) inset',
+        transition: 'top .10s ease, left .10s ease, width .10s ease, height .10s ease'
+      })
+      highlight.appendChild(part)
+    }
   }
 
   function showRangeHighlight(range, elem) {
@@ -665,27 +703,66 @@
 
   function refreshHighlightRect() {
     if (!highlight || !highlight._raElement || !highlight._raElement.isConnected) return
-    let rect = null
+    let rects = []
     if (highlight._raRange) {
       try {
-        const rangeRect = highlight._raRange.getBoundingClientRect()
-        if (rangeRect.width && rangeRect.height) rect = rangeRect
+        rects = mergeHighlightLineRects(Array.from(highlight._raRange.getClientRects()))
       }
       catch (err) {}
     }
-    if (!rect) rect = highlight._raElement.getBoundingClientRect()
-    if (!rect || !rect.width || !rect.height || rect.bottom < 0 || rect.top > innerHeight) {
+    if (!rects.length) {
+      const rect = highlight._raElement.getBoundingClientRect()
+      if (rect && rect.width && rect.height) rects = [rect]
+    }
+    rects = rects.filter(rect => rect.right >= 0 && rect.left <= innerWidth && rect.bottom >= 0 && rect.top <= innerHeight)
+    if (!rects.length) {
       highlight.style.display = 'none'
       return
     }
 
-    const left = Math.max(0, rect.left - 3)
-    const top = Math.max(0, rect.top - 2)
+    ensureHighlightParts(rects.length)
     highlight.style.display = 'block'
-    highlight.style.left = left + 'px'
-    highlight.style.top = top + 'px'
-    highlight.style.width = Math.max(0, Math.min(innerWidth - left, rect.width + 6)) + 'px'
-    highlight.style.height = rect.height + 4 + 'px'
+    const parts = Array.from(highlight.children)
+    for (let i = 0; i < parts.length; i++) {
+      const part = parts[i]
+      const rect = rects[i]
+      if (!rect) {
+        part.style.display = 'none'
+        continue
+      }
+      const left = Math.max(0, rect.left - 3)
+      const top = Math.max(0, rect.top - 2)
+      part.style.display = 'block'
+      part.style.left = left + 'px'
+      part.style.top = top + 'px'
+      part.style.width = Math.max(0, Math.min(innerWidth - left, rect.width + 6)) + 'px'
+      part.style.height = rect.height + 4 + 'px'
+    }
+  }
+
+  function mergeHighlightLineRects(rects) {
+    const items = rects
+      .filter(rect => rect && rect.width > 0 && rect.height > 0)
+      .map(rect => ({left: rect.left, right: rect.right, top: rect.top, bottom: rect.bottom, width: rect.width, height: rect.height}))
+      .sort((a, b) => a.top - b.top || a.left - b.left)
+    const lines = []
+    for (const rect of items) {
+      const line = lines[lines.length - 1]
+      const overlap = line ? Math.min(line.bottom, rect.bottom) - Math.max(line.top, rect.top) : 0
+      const sameLine = line && overlap >= Math.min(line.height, rect.height) * .5
+      if (sameLine && rect.left <= line.right + 12) {
+        line.left = Math.min(line.left, rect.left)
+        line.right = Math.max(line.right, rect.right)
+        line.top = Math.min(line.top, rect.top)
+        line.bottom = Math.max(line.bottom, rect.bottom)
+        line.width = line.right - line.left
+        line.height = line.bottom - line.top
+      }
+      else {
+        lines.push({...rect})
+      }
+    }
+    return lines
   }
 
   function hideHighlight() {

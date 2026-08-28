@@ -237,14 +237,32 @@
     Object.assign(highlight.style, {
       position: "fixed",
       display: "none",
+      left: "0",
+      top: "0",
+      width: "0",
+      height: "0",
       pointerEvents: "none",
-      zIndex: "2147483646",
-      borderRadius: "4px",
-      background: "rgba(255, 213, 79, .28)",
-      boxShadow: "0 0 0 2px rgba(255, 193, 7, .58) inset",
-      transition: "top .10s ease, left .10s ease, width .10s ease, height .10s ease"
+      zIndex: "2147483646"
     })
     document.documentElement.appendChild(highlight)
+  }
+
+  function ensureHighlightParts(count) {
+    ensureHighlight()
+    while (highlight.children.length < count) {
+      const part = document.createElement("div")
+      part.className = "read-aloud-firefox-highlight-part"
+      Object.assign(part.style, {
+        position: "fixed",
+        display: "none",
+        pointerEvents: "none",
+        borderRadius: "4px",
+        background: "rgba(255, 213, 79, .28)",
+        boxShadow: "0 0 0 2px rgba(255, 193, 7, .58) inset",
+        transition: "top .10s ease, left .10s ease, width .10s ease, height .10s ease"
+      })
+      highlight.appendChild(part)
+    }
   }
 
   function updateController(state) {
@@ -382,32 +400,74 @@
     if (highlight) highlight.style.display = "none"
   }
 
-  function getCurrentHighlightRect() {
+  function getCurrentHighlightRects() {
     if (highlightedRange) {
       try {
-        const rangeRect = highlightedRange.getBoundingClientRect()
-        if (rangeRect.width && rangeRect.height) return rangeRect
+        const rects = mergeHighlightLineRects(Array.from(highlightedRange.getClientRects()))
+        if (rects.length) return rects
       }
       catch (err) {}
     }
-    if (highlightedElement && highlightedElement.isConnected) return highlightedElement.getBoundingClientRect()
-    return null
+    if (highlightedElement && highlightedElement.isConnected) {
+      const rect = highlightedElement.getBoundingClientRect()
+      return rect && rect.width && rect.height ? [rect] : []
+    }
+    return []
+  }
+
+  function mergeHighlightLineRects(rects) {
+    const items = rects
+      .filter(rect => rect && rect.width > 0 && rect.height > 0)
+      .map(rect => ({left: rect.left, right: rect.right, top: rect.top, bottom: rect.bottom, width: rect.width, height: rect.height}))
+      .sort((a, b) => a.top - b.top || a.left - b.left)
+    const lines = []
+    for (const rect of items) {
+      const line = lines[lines.length - 1]
+      const overlap = line ? Math.min(line.bottom, rect.bottom) - Math.max(line.top, rect.top) : 0
+      const sameLine = line && overlap >= Math.min(line.height, rect.height) * .5
+      if (sameLine && rect.left <= line.right + 12) {
+        line.left = Math.min(line.left, rect.left)
+        line.right = Math.max(line.right, rect.right)
+        line.top = Math.min(line.top, rect.top)
+        line.bottom = Math.max(line.bottom, rect.bottom)
+        line.width = line.right - line.left
+        line.height = line.bottom - line.top
+      }
+      else {
+        lines.push({...rect})
+      }
+    }
+    return lines
   }
 
   function refreshHighlightRect() {
     if (!highlight || !highlightedElement || !highlightedElement.isConnected) return
-    const rect = getCurrentHighlightRect()
-    if (!rect || !rect.width || !rect.height || rect.bottom < 0 || rect.top > window.innerHeight) {
+    const rects = getCurrentHighlightRects().filter(rect =>
+      rect.right >= 0 && rect.left <= window.innerWidth && rect.bottom >= 0 && rect.top <= window.innerHeight
+    )
+    if (!rects.length) {
       highlight.style.display = "none"
       return
     }
-    const left = Math.max(0, rect.left - 3)
-    const top = Math.max(0, rect.top - 2)
+
+    ensureHighlightParts(rects.length)
     highlight.style.display = "block"
-    highlight.style.left = left + "px"
-    highlight.style.top = top + "px"
-    highlight.style.width = Math.max(0, Math.min(window.innerWidth - left, rect.width + 6)) + "px"
-    highlight.style.height = (rect.height + 4) + "px"
+    const parts = Array.from(highlight.children)
+    for (let i = 0; i < parts.length; i++) {
+      const part = parts[i]
+      const rect = rects[i]
+      if (!rect) {
+        part.style.display = "none"
+        continue
+      }
+      const left = Math.max(0, rect.left - 3)
+      const top = Math.max(0, rect.top - 2)
+      part.style.display = "block"
+      part.style.left = left + "px"
+      part.style.top = top + "px"
+      part.style.width = Math.max(0, Math.min(window.innerWidth - left, rect.width + 6)) + "px"
+      part.style.height = (rect.height + 4) + "px"
+    }
   }
 
   function resolveSpeechChunk(info) {
@@ -500,8 +560,8 @@
   }
 
   function rangeForSourceSpan(startSourceIndex, endSourceIndex) {
-    const startDomIndex = nearestMappedDomIndex(startSourceIndex)
-    const endDomIndex = nearestMappedDomIndex(endSourceIndex)
+    const startDomIndex = mappedDomIndexAtOrAfter(startSourceIndex, 12)
+    const endDomIndex = mappedDomIndexAtOrBefore(endSourceIndex, 12)
     if (startDomIndex == null || endDomIndex == null || startDomIndex > endDomIndex) {
       return rangeForSourceToken(startSourceIndex)
     }
@@ -545,6 +605,26 @@
       if (after < sourceToDom.length && sourceToDom[after] != null) return sourceToDom[after]
       const before = start - distance
       if (before >= 0 && sourceToDom[before] != null) return sourceToDom[before]
+    }
+    return null
+  }
+
+  function mappedDomIndexAtOrAfter(sourceIndex, maxDistance) {
+    if (!sourceToDom.length) return null
+    const start = Math.max(0, Math.min(sourceToDom.length - 1, sourceIndex))
+    for (let distance = 0; distance <= maxDistance && start + distance < sourceToDom.length; distance++) {
+      const value = sourceToDom[start + distance]
+      if (value != null) return value
+    }
+    return null
+  }
+
+  function mappedDomIndexAtOrBefore(sourceIndex, maxDistance) {
+    if (!sourceToDom.length) return null
+    const start = Math.max(0, Math.min(sourceToDom.length - 1, sourceIndex))
+    for (let distance = 0; distance <= maxDistance && start - distance >= 0; distance++) {
+      const value = sourceToDom[start - distance]
+      if (value != null) return value
     }
     return null
   }
