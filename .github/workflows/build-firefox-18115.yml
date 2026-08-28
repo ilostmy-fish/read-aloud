@@ -1,0 +1,68 @@
+name: Build Firefox XPI 1.81.15
+
+on:
+  push:
+    branches:
+      - firefox-edge-read-aloud
+    paths:
+      - '.github/workflows/build-firefox-18115.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: firefox-edge-read-aloud
+
+      - name: Apply per-line sentence highlight fix
+        run: python3 .github/scripts/fix18115.py
+
+      - name: Validate source
+        shell: bash
+        run: |
+          node --check js/firefox-page.js
+          node --check js/firefox-chatgpt.js
+          node --check js/firefox-chatgpt-background.js
+          node --check js/firefox-tts.js
+          test "$(jq -r .version manifest.json)" = "1.81.15"
+          grep -q 'getClientRects' js/firefox-page.js
+          grep -q 'getClientRects' js/firefox-chatgpt.js
+          grep -q 'mappedDomIndexAtOrAfter' js/firefox-page.js
+          grep -q 'mappedDomIndexAtOrBefore' js/firefox-page.js
+          grep -q 'mappedValueAtOrAfter' js/firefox-chatgpt.js
+          grep -q 'mappedValueAtOrBefore' js/firefox-chatgpt.js
+          grep -q 'speech.engine === "Piper" || speech.engine === "Supertonic"' js/firefox-page.js
+          grep -q "info.speech.engine === 'Piper' || info.speech.engine === 'Supertonic'" js/firefox-chatgpt.js
+          if grep -RIn --include='*.js' 'innerHTML[[:space:]]*=' js | grep -v 'jquery'; then
+            echo 'First-party innerHTML assignment reintroduced'
+            exit 1
+          fi
+
+      - name: Commit 1.81.15 source
+        shell: bash
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add js/firefox-page.js js/firefox-chatgpt.js manifest.json
+          git commit -m 'Render sentence highlights per line'
+          git push origin HEAD:firefox-edge-read-aloud
+
+      - name: Build Firefox XPI
+        shell: bash
+        run: |
+          mkdir -p build
+          zip -r build/read-aloud-firefox-1.81.15.xpi _locales css icons img js sound *.html manifest.json
+          unzip -t build/read-aloud-firefox-1.81.15.xpi
+          unzip -p build/read-aloud-firefox-1.81.15.xpi manifest.json | jq -e '.version == "1.81.15"'
+
+      - name: Upload Firefox XPI
+        uses: actions/upload-artifact@v4
+        with:
+          name: read-aloud-firefox-1.81.15
+          path: build/read-aloud-firefox-1.81.15.xpi
+          if-no-files-found: error
+          compression-level: 0
