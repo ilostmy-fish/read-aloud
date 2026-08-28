@@ -691,7 +691,7 @@ function authWavenet() {
             "elem.style.fontSize = 'larger'",
             "elem.style.zIndex = 999000",
             "elem.style.textAlign = 'center'",
-            "elem.innerHTML = 'Please click the blue SPEAK-IT button, then check the I-AM-NOT-A-ROBOT checkbox.'",
+            "elem.textContent = 'Please click the blue SPEAK-IT button, then check the I-AM-NOT-A-ROBOT checkbox.'",
             "document.body.appendChild(elem)",
             "1"
           ]
@@ -704,7 +704,7 @@ function authWavenet() {
           code: [
             "var elem = document.getElementById('ra-notice')",
             "elem.style.backgroundColor = '#0d0'",
-            "elem.innerHTML = 'Successful, you can now use Google Wavenet voices. You may close this tab.'"
+            "elem.textContent = 'Successful, you can now use Google Wavenet voices. You may close this tab.'"
           ]
           .join(";\n")
         })
