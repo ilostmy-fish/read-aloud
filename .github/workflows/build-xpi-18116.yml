@@ -1,0 +1,64 @@
+name: Build Firefox 1.81.16
+
+on:
+  push:
+    branches:
+      - firefox-edge-read-aloud
+    paths:
+      - .github/workflows/build-xpi-18116.yml
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: firefox-edge-read-aloud
+          fetch-depth: 0
+
+      - name: Apply 1.81.16 patch
+        run: python3 .github/patch_18116.py
+
+      - name: Validate source
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(python3 -c 'import json; print(json.load(open("manifest.json"))["version"])')" = "1.81.16"
+          node --check js/popup.js
+          node --check js/firefox-fixes.js
+          grep -q 'id="popup-rate-input"' popup.html
+          grep -q 'adjustPopupRate' js/popup.js
+          grep -q 'setPopupRate' js/firefox-fixes.js
+          grep -q 'POPUP_RATE_RESTART_DELAY = 600' js/firefox-fixes.js
+          grep -q 'restartCurrentSentenceWithRate' js/firefox-fixes.js
+          grep -q 'getCurrentSentenceSessionOffset' js/firefox-fixes.js
+          ! grep -RIn --exclude='jquery-3.7.1.min.js' 'innerHTML' js manifest.json
+
+      - name: Commit source changes
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add popup.html css/popup.css js/popup.js js/firefox-fixes.js manifest.json
+          git commit -m 'Add popup speed control and sentence restart'
+          git push origin HEAD:firefox-edge-read-aloud
+
+      - name: Build XPI
+        shell: bash
+        run: |
+          set -euo pipefail
+          zip -qr read-aloud-firefox-1.81.16.xpi . \
+            -x '.git/*' '.github/*' 'read-aloud-firefox-1.81.16.xpi'
+          unzip -t read-aloud-firefox-1.81.16.xpi >/dev/null
+          test "$(unzip -p read-aloud-firefox-1.81.16.xpi manifest.json | python3 -c 'import json,sys; print(json.load(sys.stdin)["version"])')" = "1.81.16"
+
+      - name: Upload XPI
+        uses: actions/upload-artifact@v4
+        with:
+          name: read-aloud-firefox-1.81.16
+          path: read-aloud-firefox-1.81.16.xpi
+          if-no-files-found: error
