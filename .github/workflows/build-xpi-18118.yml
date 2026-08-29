@@ -1,0 +1,75 @@
+name: Build Firefox 1.81.18
+
+on:
+  push:
+    branches:
+      - firefox-edge-read-aloud
+    paths:
+      - .github/workflows/build-xpi-18118.yml
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: firefox-edge-read-aloud
+          fetch-depth: 0
+
+      - name: Apply 1.81.18 patch
+        run: python3 .github/patch_18118.py
+
+      - name: Validate source
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(python3 -c 'import json; print(json.load(open("manifest.json"))["version"])')" = "1.81.18"
+          node --check js/firefox-page.js
+          node --check js/firefox-fixes.js
+          python3 - <<'PY'
+          from pathlib import Path
+          s = Path('js/firefox-page.js').read_text()
+          assert 'panel.append(playButton, rateInput, decreaseRateButton, increaseRateButton)' in s
+          assert 'rateInput.addEventListener("blur", commitReadAloudRateInput)' in s
+          assert 'rateInput.addEventListener("change"' not in s
+          assert 'send("setReadAloudRate", value)' not in s
+          assert 'stopButton' not in s
+          assert 'statusNode' not in s
+          assert 'rateLabel' not in s
+          assert 'rateLabel.textContent = "Speed"' not in s
+          assert 'sanitizeReadAloudRateText' in s
+          assert 'adjustReadAloudRate(-0.25)' in s
+          assert 'adjustReadAloudRate(0.25)' in s
+          popup = Path('popup.html').read_text()
+          assert 'popup-rate-input' not in popup
+          PY
+          ! grep -RIn --exclude='jquery-3.7.1.min.js' 'innerHTML' js manifest.json
+
+      - name: Commit source changes
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add js/firefox-page.js manifest.json
+          git commit -m 'Simplify on-page speed controls and defer typed rate changes'
+          git push origin HEAD:firefox-edge-read-aloud
+
+      - name: Build XPI
+        shell: bash
+        run: |
+          set -euo pipefail
+          zip -qr read-aloud-firefox-1.81.18.xpi . \
+            -x '.git/*' '.github/*' 'read-aloud-firefox-1.81.18.xpi'
+          unzip -t read-aloud-firefox-1.81.18.xpi >/dev/null
+          test "$(unzip -p read-aloud-firefox-1.81.18.xpi manifest.json | python3 -c 'import json,sys; print(json.load(sys.stdin)["version"])')" = "1.81.18"
+
+      - name: Upload XPI
+        uses: actions/upload-artifact@v4
+        with:
+          name: read-aloud-firefox-1.81.18
+          path: read-aloud-firefox-1.81.18.xpi
+          if-no-files-found: error
