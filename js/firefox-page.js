@@ -12,6 +12,7 @@
   let playButton = null
   let stopButton = null
   let statusNode = null
+  let rateInput = null
   let highlight = null
   let highlightedElement = null
   let highlightedRange = null
@@ -71,6 +72,14 @@
 
   window.addEventListener("scroll", refreshHighlightRect, {passive: true})
   window.addEventListener("resize", refreshHighlightRect, {passive: true})
+
+  if (api.storage && api.storage.onChanged) {
+    api.storage.onChanged.addListener((changes, areaName) => {
+      if (areaName !== "local" || !changes.rate || !rateInput || !rateInput.isConnected) return
+      if (shadow && shadow.activeElement === rateInput) return
+      rateInput.value = formatReadAloudRate(changes.rate.newValue == null ? 1 : changes.rate.newValue)
+    })
+  }
 
   const mutationObserver = new MutationObserver(mutations => {
     if (!sessionText) return
@@ -193,6 +202,36 @@
       button:hover { background: rgba(255, 255, 255, .22); }
       button:disabled { cursor: default; opacity: .55; }
       .status { min-width: 58px; text-align: center; user-select: none; }
+      .rate-control {
+        display: flex;
+        align-items: center;
+        gap: 5px;
+        margin-left: 2px;
+      }
+      .rate-label {
+        color: rgba(255, 255, 255, .78);
+        user-select: none;
+      }
+      .rate-button {
+        width: 28px;
+        font-size: 17px;
+      }
+      .rate-input {
+        box-sizing: border-box;
+        width: 62px;
+        height: 30px;
+        border: 1px solid rgba(255, 255, 255, .22);
+        border-radius: 7px;
+        outline: none;
+        background: rgba(255, 255, 255, .09);
+        color: white;
+        text-align: center;
+        font: 13px/1.2 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      }
+      .rate-input:focus {
+        border-color: rgba(255, 255, 255, .55);
+        background: rgba(255, 255, 255, .14);
+      }
     `
 
     const panel = document.createElement("div")
@@ -224,10 +263,114 @@
     statusNode.className = "status"
     statusNode.textContent = "Reading"
 
-    panel.append(playButton, stopButton, statusNode)
+    const rateControl = document.createElement("span")
+    rateControl.className = "rate-control"
+
+    const rateLabel = document.createElement("span")
+    rateLabel.className = "rate-label"
+    rateLabel.textContent = "Speed"
+
+    const decreaseRateButton = document.createElement("button")
+    decreaseRateButton.type = "button"
+    decreaseRateButton.className = "rate-button"
+    decreaseRateButton.title = "Decrease speed by 0.25"
+    decreaseRateButton.setAttribute("aria-label", "Decrease speech speed by 0.25")
+    decreaseRateButton.textContent = "−"
+    decreaseRateButton.addEventListener("click", event => {
+      event.preventDefault()
+      event.stopPropagation()
+      adjustReadAloudRate(-0.25)
+    })
+
+    rateInput = document.createElement("input")
+    rateInput.type = "text"
+    rateInput.inputMode = "decimal"
+    rateInput.className = "rate-input"
+    rateInput.title = "Speech speed multiplier"
+    rateInput.setAttribute("aria-label", "Speech speed multiplier")
+    rateInput.autocomplete = "off"
+    rateInput.spellcheck = false
+    rateInput.addEventListener("input", onReadAloudRateInput)
+    rateInput.addEventListener("change", commitReadAloudRateInput)
+    rateInput.addEventListener("keydown", event => {
+      if (event.key === "Enter") {
+        event.preventDefault()
+        commitReadAloudRateInput()
+        rateInput.select()
+      }
+    })
+
+    const increaseRateButton = document.createElement("button")
+    increaseRateButton.type = "button"
+    increaseRateButton.className = "rate-button"
+    increaseRateButton.title = "Increase speed by 0.25"
+    increaseRateButton.setAttribute("aria-label", "Increase speech speed by 0.25")
+    increaseRateButton.textContent = "+"
+    increaseRateButton.addEventListener("click", event => {
+      event.preventDefault()
+      event.stopPropagation()
+      adjustReadAloudRate(0.25)
+    })
+
+    rateControl.append(rateLabel, decreaseRateButton, rateInput, increaseRateButton)
+    panel.append(playButton, stopButton, statusNode, rateControl)
     shadow.append(style, panel)
     document.documentElement.appendChild(host)
+    loadControllerRate()
     ensureHighlight()
+  }
+
+  function loadControllerRate() {
+    return api.storage.local.get("rate")
+      .then(settings => {
+        if (rateInput && (!shadow || shadow.activeElement !== rateInput)) {
+          rateInput.value = formatReadAloudRate(settings.rate == null ? 1 : settings.rate)
+        }
+      })
+      .catch(() => {})
+  }
+
+  function adjustReadAloudRate(delta) {
+    if (!rateInput) return
+    const current = Number(rateInput.value.trim())
+    if (Number.isFinite(current)) {
+      applyReadAloudRate(current + delta)
+      return
+    }
+    api.storage.local.get("rate")
+      .then(settings => applyReadAloudRate((settings.rate == null ? 1 : Number(settings.rate)) + delta))
+      .catch(() => {})
+  }
+
+  function onReadAloudRateInput() {
+    if (!rateInput) return
+    const value = Number(rateInput.value.trim())
+    if (Number.isFinite(value) && value >= .1 && value <= 10) {
+      send("setReadAloudRate", value).catch(() => {})
+    }
+  }
+
+  function commitReadAloudRateInput() {
+    if (!rateInput) return
+    const value = Number(rateInput.value.trim())
+    applyReadAloudRate(Number.isFinite(value) ? value : 1)
+  }
+
+  function applyReadAloudRate(value) {
+    if (!rateInput) return
+    const rate = normalizeReadAloudRate(value)
+    rateInput.value = formatReadAloudRate(rate)
+    send("setReadAloudRate", rate).catch(() => {})
+  }
+
+  function normalizeReadAloudRate(value) {
+    const number = Number(value)
+    const clamped = Math.min(10, Math.max(.1, Number.isFinite(number) ? number : 1))
+    return Math.round(clamped * 1000000) / 1000000
+  }
+
+  function formatReadAloudRate(value) {
+    return String(normalizeReadAloudRate(value))
   }
 
   function ensureHighlight() {
@@ -303,7 +446,7 @@
     pendingSelectionElement = null
     if (host) host.remove()
     if (highlight) highlight.remove()
-    host = shadow = playButton = stopButton = statusNode = highlight = null
+    host = shadow = playButton = stopButton = statusNode = rateInput = highlight = null
     clearSessionMapping()
   }
 

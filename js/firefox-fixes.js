@@ -5,9 +5,9 @@
   const originalPause = pause
   const originalPlayTab = playTab
   let readSessionSerial = 0
-  let popupRateRestartTimer = null
-  let latestPopupRate = null
-  const POPUP_RATE_RESTART_DELAY = 600
+  let rateRestartTimer = null
+  let latestReadAloudRate = null
+  const RATE_RESTART_DELAY = 600
 
   startReadAloud = async function(tab) {
     if (!tab || tab.id == null || tab.id == -1) return
@@ -121,17 +121,17 @@
     return restartReadSession(tabId, offset, autoplay)
   }
 
-  handlers.setPopupRate = function(rate) {
-    const normalizedRate = normalizePopupRate(rate)
-    latestPopupRate = normalizedRate
+  handlers.setReadAloudRate = function(rate) {
+    const normalizedRate = normalizeReadAloudRate(rate)
+    latestReadAloudRate = normalizedRate
 
-    if (popupRateRestartTimer) clearTimeout(popupRateRestartTimer)
-    popupRateRestartTimer = setTimeout(function() {
-      popupRateRestartTimer = null
-      Promise.resolve(updateSettings({rate: latestPopupRate}))
+    if (rateRestartTimer) clearTimeout(rateRestartTimer)
+    rateRestartTimer = setTimeout(function() {
+      rateRestartTimer = null
+      Promise.resolve(updateSettings({rate: latestReadAloudRate}))
         .then(restartCurrentSentenceWithRate)
         .catch(handleError)
-    }, POPUP_RATE_RESTART_DELAY)
+    }, RATE_RESTART_DELAY)
 
     return updateSettings({rate: normalizedRate}).then(function() {
       return normalizedRate
@@ -313,7 +313,7 @@
     return tokens
   }
 
-  function normalizePopupRate(rate) {
+  function normalizeReadAloudRate(rate) {
     const value = Number(rate)
     if (!Number.isFinite(value)) return 1
     return Math.round(Math.min(10, Math.max(.1, value)) * 1000000) / 1000000
