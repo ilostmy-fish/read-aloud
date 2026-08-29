@@ -5,6 +5,9 @@
   const originalPause = pause
   const originalPlayTab = playTab
   let readSessionSerial = 0
+  let popupRateRestartTimer = null
+  let latestPopupRate = null
+  const POPUP_RATE_RESTART_DELAY = 600
 
   startReadAloud = async function(tab) {
     if (!tab || tab.id == null || tab.id == -1) return
@@ -118,6 +121,23 @@
     return restartReadSession(tabId, offset, autoplay)
   }
 
+  handlers.setPopupRate = function(rate) {
+    const normalizedRate = normalizePopupRate(rate)
+    latestPopupRate = normalizedRate
+
+    if (popupRateRestartTimer) clearTimeout(popupRateRestartTimer)
+    popupRateRestartTimer = setTimeout(function() {
+      popupRateRestartTimer = null
+      Promise.resolve(updateSettings({rate: latestPopupRate}))
+        .then(restartCurrentSentenceWithRate)
+        .catch(handleError)
+    }, POPUP_RATE_RESTART_DELAY)
+
+    return updateSettings({rate: normalizedRate}).then(function() {
+      return normalizedRate
+    })
+  }
+
   restartReadSession = async function(tabId, offset, autoplay) {
     const session = readSessions[tabId]
     if (!session || tabId !== activeReadTabId) return
@@ -215,6 +235,88 @@
     result.generation = session.generation || 0
     if (session.paused && result.state != "LOADING") result.state = "PAUSED"
     return result
+  }
+
+  async function restartCurrentSentenceWithRate() {
+    const tabId = activeReadTabId
+    const session = tabId != null ? readSessions[tabId] : null
+    if (!session || !activeDoc || tabId !== activeReadTabId) return
+
+    const state = await getPlaybackState()
+    if (state == "STOPPED") return
+    const autoplay = !(session.paused || state == "PAUSED")
+    const offset = await getCurrentSentenceSessionOffset(session)
+    return restartReadSession(tabId, offset, autoplay)
+  }
+
+  async function getCurrentSentenceSessionOffset(session) {
+    const speech = await getActiveSpeech()
+    if (!speech || !session.fullText) return session.offset || 0
+
+    const info = speech.getInfo()
+    if (!info || !Array.isArray(info.texts) || !info.texts.length) return session.offset || 0
+
+    const position = info.position || {}
+    let index = Number(position.index)
+    if (!Number.isInteger(index)) index = 0
+    index = Math.max(0, Math.min(info.texts.length - 1, index))
+
+    let speechPrefix = info.texts.slice(0, index).join("")
+    if (info.engine != "Piper" && info.engine != "Supertonic") {
+      const currentText = String(info.texts[index] || "")
+      let sentenceStart = 0
+      if (typeof firefoxReadAloudBoundary != "undefined" && firefoxReadAloudBoundary && firefoxReadAloudBoundary.text === currentText) {
+        sentenceStart = findSentenceStart(currentText, Number(firefoxReadAloudBoundary.charIndex) || 0)
+      }
+      speechPrefix += currentText.slice(0, sentenceStart)
+    }
+
+    const tokenOrdinal = countRateTokens(speechPrefix)
+    if (tokenOrdinal <= 0) return session.offset || 0
+
+    const remaining = session.fullText.slice(session.offset || 0)
+    const sourceTokens = getRateTokenOffsets(remaining)
+    if (tokenOrdinal >= sourceTokens.length) return session.offset || 0
+    return (session.offset || 0) + sourceTokens[tokenOrdinal].start
+  }
+
+  function findSentenceStart(text, charIndex) {
+    const limit = Math.max(0, Math.min(Number(charIndex) || 0, text.length))
+    let start = 0
+    const re = /[.!?]+[\s\u200b]+/g
+    let match
+    while ((match = re.exec(text))) {
+      const end = match.index + match[0].length
+      if (end > limit) break
+      start = end
+    }
+    while (start < text.length && /\s/.test(text[start])) start++
+    return start
+  }
+
+  function countRateTokens(text) {
+    return getRateTokenOffsets(text).length
+  }
+
+  function getRateTokenOffsets(text) {
+    const tokens = []
+    const value = String(text || "")
+    let re
+    try {
+      re = new RegExp("[\\p{L}\\p{N}]+(?:['’][\\p{L}\\p{N}]+)*", "gu")
+    }
+    catch (err) {
+      re = /[A-Za-z0-9]+(?:['’][A-Za-z0-9]+)*/g
+    }
+    let match
+    while ((match = re.exec(value))) tokens.push({start: match.index, end: match.index + match[0].length})
+    return tokens
+  }
+
+  function normalizePopupRate(rate) {
+    const value = Number(rate)
+    if (!Number.isFinite(value)) return 1
+    return Math.round(Math.min(10, Math.max(.1, value)) * 1000000) / 1000000
   }
 
   function resetPageMapping(tabId) {

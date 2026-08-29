@@ -47,6 +47,54 @@ body {
   vertical-align: text-bottom;
 }
 
+#rate-control {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: .3rem;
+  margin: -4px 15px 12px;
+  font-size: .875rem;
+}
+#rate-control .rate-label {
+  margin-right: .2rem;
+  color: #666;
+}
+#rate-control button,
+#popup-rate-input {
+  box-sizing: border-box;
+  height: 28px;
+  border: 1px solid #c8c8c8;
+  background: #f8f9fa;
+  color: #212529;
+}
+#rate-control button {
+  width: 30px;
+  padding: 0;
+  border-radius: 5px;
+  cursor: pointer;
+  font-size: 1rem;
+  line-height: 1;
+}
+#rate-control button:hover {
+  background: #e2e6ea;
+}
+#popup-rate-input {
+  width: 74px;
+  padding: 2px 6px;
+  border-radius: 4px;
+  text-align: center;
+  font: inherit;
+}
+.dark-mode #rate-control .rate-label {
+  color: #bbb;
+}
+.dark-mode #rate-control button,
+.dark-mode #popup-rate-input {
+  background: #3e3e3e;
+  color: #ddd;
+  border-color: #666;
+}
+
 body.is-popup #highlight {
   width: 350px;
   height: 300px;

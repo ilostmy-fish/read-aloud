@@ -28,6 +28,18 @@ $(function() {
   $("#decrease-window-size").click(changeWindowSize.bind(null, -1));
   $("#increase-window-size").click(changeWindowSize.bind(null, +1));
   $("#toggle-dark-mode").click(toggleDarkMode);
+  $("#decrease-rate").click(adjustPopupRate.bind(null, -1));
+  $("#increase-rate").click(adjustPopupRate.bind(null, +1));
+  $("#popup-rate-input")
+    .on("input", onPopupRateInput)
+    .on("change", commitPopupRateInput)
+    .on("keydown", function(event) {
+      if (event.key == "Enter") {
+        event.preventDefault()
+        commitPopupRateInput.call(this)
+        this.select()
+      }
+    });
 
   updateButtons()
     .then(getSettings.bind(null, ["showHighlighting", "readAloudTab"]))
@@ -143,6 +155,9 @@ function updateButtons() {
     $("#btnPause").toggle(state == "PLAYING");
     $("#btnStop").toggle(state == "PAUSED" || state == "PLAYING" || state == "LOADING");
     $("#btnForward, #btnRewind").toggle(state == "PLAYING" || state == "PAUSED");
+    if (!$("#popup-rate-input").is(":focus")) {
+      $("#popup-rate-input").val(formatPopupRate(settings.rate != null ? settings.rate : defaults.rate))
+    }
 
     if (showHighlighting && (state == "LOADING" || state == "PAUSED" || state == "PLAYING") && speech) {
       $("#highlight, #toolbar").show()
@@ -267,6 +282,47 @@ function onRewind() {
 function onSeek(n) {
   bgPageInvoke("seek", [n])
     .catch(handleError)
+}
+
+function adjustPopupRate(delta) {
+  const input = $("#popup-rate-input")
+  const current = Number(input.val().trim())
+  if (Number.isFinite(current)) {
+    applyPopupRate(current + delta)
+  }
+  else {
+    getSettings(["rate"])
+      .then(settings => applyPopupRate((settings.rate != null ? settings.rate : defaults.rate) + delta))
+      .catch(handleError)
+  }
+}
+
+function onPopupRateInput() {
+  const value = Number($(this).val().trim())
+  if (Number.isFinite(value) && value >= .1 && value <= 10) {
+    bgPageInvoke("setPopupRate", [value]).catch(handleError)
+  }
+}
+
+function commitPopupRateInput() {
+  const value = Number($(this).val().trim())
+  applyPopupRate(Number.isFinite(value) ? value : 1)
+}
+
+function applyPopupRate(value) {
+  const rate = normalizePopupRate(value)
+  $("#popup-rate-input").val(formatPopupRate(rate))
+  return bgPageInvoke("setPopupRate", [rate]).catch(handleError)
+}
+
+function normalizePopupRate(value) {
+  const number = Number(value)
+  const clamped = Math.min(10, Math.max(.1, Number.isFinite(number) ? number : 1))
+  return Math.round(clamped * 1000000) / 1000000
+}
+
+function formatPopupRate(value) {
+  return String(normalizePopupRate(value))
 }
 
 function changeFontSize(delta) {
