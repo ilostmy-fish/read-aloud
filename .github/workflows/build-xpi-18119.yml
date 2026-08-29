@@ -1,0 +1,77 @@
+name: Build Firefox 1.81.19
+
+on:
+  push:
+    branches:
+      - firefox-edge-read-aloud
+    paths:
+      - .github/workflows/build-xpi-18119.yml
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: firefox-edge-read-aloud
+          fetch-depth: 0
+
+      - name: Apply 1.81.19 version bump
+        run: python3 .github/patch_18119.py
+
+      - name: Validate source and third-party library
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(python3 -c 'import json; print(json.load(open("manifest.json"))["version"])')" = "1.81.19"
+          test "$(sha256sum js/jquery-3.7.1.min.js | cut -d' ' -f1)" = "fc9a93dd241f6b045cbff0481cf4e1901becd0e12fb45166a8f17f95823f0b1a"
+          node --check js/firefox-page.js
+          node --check js/firefox-fixes.js
+
+      - name: Commit version bump
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add manifest.json
+          git commit -m 'Package Firefox 1.81.19 for AMO signing'
+          git push origin HEAD:firefox-edge-read-aloud
+
+      - name: Build runtime-only XPI
+        shell: bash
+        run: |
+          set -euo pipefail
+          zip -qr read-aloud-firefox-1.81.19.xpi _locales css icons img js sound *.html manifest.json
+          unzip -t read-aloud-firefox-1.81.19.xpi >/dev/null
+          test "$(unzip -p read-aloud-firefox-1.81.19.xpi manifest.json | python3 -c 'import json,sys; print(json.load(sys.stdin)["version"])')" = "1.81.19"
+          ! unzip -Z1 read-aloud-firefox-1.81.19.xpi | grep -q '^docs/'
+          ! unzip -Z1 read-aloud-firefox-1.81.19.xpi | grep -q '^page-scripts/'
+          ! unzip -Z1 read-aloud-firefox-1.81.19.xpi | grep -qE '^(README|package(-lock)?\.json|introduction\.md|\.github/)'
+          python3 - <<'PY'
+          import re, zipfile
+          z = zipfile.ZipFile('read-aloud-firefox-1.81.19.xpi')
+          bad = []
+          for name in z.namelist():
+              if not name.endswith('.html'):
+                  continue
+              text = z.read(name).decode('utf-8', 'replace')
+              for m in re.finditer(r'<script\b([^>]*)>', text, re.I):
+                  attrs = m.group(1)
+                  if not re.search(r'\bsrc\s*=', attrs, re.I):
+                      bad.append((name, 'inline script'))
+                  if re.search(r'\bsrc\s*=\s*["\']https?://', attrs, re.I):
+                      bad.append((name, 'remote script'))
+          if bad:
+              raise SystemExit('unsafe packaged script tags: ' + repr(bad))
+          PY
+
+      - name: Upload XPI
+        uses: actions/upload-artifact@v4
+        with:
+          name: read-aloud-firefox-1.81.19
+          path: read-aloud-firefox-1.81.19.xpi
+          if-no-files-found: error
