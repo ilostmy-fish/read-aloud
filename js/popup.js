@@ -143,7 +143,6 @@ function updateButtons() {
     $("#btnPause").toggle(state == "PLAYING");
     $("#btnStop").toggle(state == "PAUSED" || state == "PLAYING" || state == "LOADING");
     $("#btnForward, #btnRewind").toggle(state == "PLAYING" || state == "PAUSED");
-
     if (showHighlighting && (state == "LOADING" || state == "PAUSED" || state == "PLAYING") && speech) {
       $("#highlight, #toolbar").show()
       updateHighlighting(speech)

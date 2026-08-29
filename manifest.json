@@ -1,33 +1,39 @@
 {
   "manifest_version": 2,
-
   "name": "__MSG_extension_name__",
   "short_name": "__MSG_extension_short_name__",
   "description": "__MSG_extension_description__",
-  "version": "1.81.0",
+  "version": "1.81.19",
   "default_locale": "en",
   "browser_specific_settings": {
     "gecko": {
-      "id": "{ddc62400-f22d-4dd3-8b4a-05837de53c2e}"
+      "id": "{4a91fcba-2377-49d1-bc23-e465df3fdd1d}",
+      "data_collection_permissions": {
+        "required": [
+          "websiteContent"
+        ]
+      }
     },
     "gecko_android": {}
   },
-
   "browser_action": {
     "default_area": "navbar",
-    "default_icon": "img/icon.png",
+    "default_icon": {
+      "16": "icons/read-aloud-16.svg",
+      "32": "icons/read-aloud-32.svg"
+    },
     "default_popup": "popup.html?isPopup=1"
   },
   "icons": {
-    "16": "img/icon-16.png",
-    "48": "img/icon-48.png",
-    "128": "img/icon.png"
+    "48": "icons/read-aloud-48.svg",
+    "96": "icons/read-aloud-96.svg"
   },
   "permissions": [
     "activeTab",
     "menus",
     "identity",
     "storage",
+    "tabHide",
     "https://translate.google.com/"
   ],
   "optional_permissions": [
@@ -39,10 +45,39 @@
     "file://*/*"
   ],
   "web_accessible_resources": [
-    "js/page/*", "img/*", "css/*"
+    "js/page/*",
+    "img/*",
+    "css/*"
   ],
   "content_security_policy": "script-src 'self'; object-src 'self'",
   "content_scripts": [
+    {
+      "matches": [
+        "http://*/*",
+        "https://*/*"
+      ],
+      "exclude_matches": [
+        "https://chatgpt.com/*",
+        "https://www.chatgpt.com/*",
+        "https://chat.openai.com/*"
+      ],
+      "run_at": "document_start",
+      "js": [
+        "js/firefox-page.js"
+      ]
+    },
+    {
+      "matches": [
+        "https://chatgpt.com/*",
+        "https://www.chatgpt.com/*",
+        "https://chat.openai.com/*"
+      ],
+      "run_at": "document_start",
+      "js": [
+        "js/firefox-chatgpt.js",
+        "js/firefox-page.js"
+      ]
+    },
     {
       "matches": [
         "https://piper.ttstool.com/"
@@ -75,7 +110,11 @@
       "js/tts-engines.js",
       "js/speech.js",
       "js/document.js",
-      "js/events.js"
+      "js/events.js",
+      "js/firefox-supertonic.js",
+      "js/firefox-tts.js",
+      "js/firefox-fixes.js",
+      "js/firefox-chatgpt-background.js"
     ],
     "persistent": true
   },
@@ -89,22 +128,30 @@
       "description": "Toggle popup"
     },
     "play": {
-      "suggested_key": {"default": "Alt+O"},
+      "suggested_key": {
+        "default": "Alt+O"
+      },
       "description": "Play/Stop"
     },
     "pause": {
-      "suggested_key": {"default": "Alt+P"},
+      "suggested_key": {
+        "default": "Alt+P"
+      },
       "description": "Play/Pause"
     },
     "stop": {
       "description": "Stop"
     },
     "forward": {
-      "suggested_key": {"default": "Alt+Period"},
+      "suggested_key": {
+        "default": "Alt+Period"
+      },
       "description": "Forward"
     },
     "rewind": {
-      "suggested_key": {"default": "Alt+Comma"},
+      "suggested_key": {
+        "default": "Alt+Comma"
+      },
       "description": "Rewind"
     }
   }

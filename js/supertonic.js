@@ -29,11 +29,10 @@ engineIdle$.pipe(
 //keep-it-open billboard
 document.addEventListener("DOMContentLoaded", () => {
   const ugaDialog = document.createElement("DIV")
-  ugaDialog.innerHTML = `
-    <div class="alert alert-warning text-center">
-      Read Aloud uses this tab to synthesize Supertonic voices. It will close automatically after 15 minutes of inactivity.
-    </div>
-  `
+  const ugaNotice = document.createElement("DIV")
+  ugaNotice.className = "alert alert-warning text-center"
+  ugaNotice.textContent = "Read Aloud uses this tab to synthesize Supertonic voices. It will close automatically after 15 minutes of inactivity."
+  ugaDialog.appendChild(ugaNotice)
   document.body.prepend(ugaDialog)
 })
 
